@@ -62,7 +62,16 @@ function extFor(mime, fallback) {
  * reversible; a crop is neither.
  */
 export async function renderCustom({
-  source, // { base64, contentType }
+  source, // { base64, contentType } | null
+  /**
+   * A source fetched server-side instead of round-tripped as base64 -- the
+   * fix the function's own long-standing comment already called for once
+   * something bigger than a short upload needed this path. An avatar clip at
+   * 30-60s/720p routinely clears what base64-in-JSON should carry, the same
+   * ceiling Video Animation's stitch hit on its own output.
+   */
+  sourceUrl = null,
+  sourceIsVideo = true,
   dimensions = "9:16",
   /** "contain" letterboxes and keeps everything; "cover" crops to fill. */
   fit = "contain",
@@ -75,7 +84,7 @@ export async function renderCustom({
 }) {
   // Wall of Text has no upload at all: the background is generated, and the
   // text layer is the entire picture. Same compositing path, one fewer input.
-  const generated = !source?.base64;
+  const generated = !source?.base64 && !sourceUrl;
   if (generated && !backgroundColor) {
     throw new Error("a source upload or a backgroundColor is required");
   }
@@ -85,7 +94,11 @@ export async function renderCustom({
   const dir = await mkdtemp(join(tmpdir(), "fe-custom-"));
 
   try {
-    const isVideo = !generated && (source.contentType ?? "").startsWith("video/");
+    const isVideo = generated
+      ? false
+      : sourceUrl
+      ? sourceIsVideo
+      : (source.contentType ?? "").startsWith("video/");
     const args = ["-y"];
 
     if (generated) {
@@ -98,6 +111,16 @@ export async function renderCustom({
         "-i",
         `color=c=${backgroundColor}:s=${w}x${h}:r=${fps}`,
       );
+    } else if (sourceUrl) {
+      const res = await fetch(sourceUrl);
+      if (!res.ok) throw new Error(`failed to fetch source: ${res.status}`);
+      const srcPath = join(dir, `source.${isVideo ? "mp4" : "png"}`);
+      await writeFile(srcPath, Buffer.from(await res.arrayBuffer()));
+      if (isVideo) {
+        args.push("-i", srcPath);
+      } else {
+        args.push("-loop", "1", "-t", String(durationSec), "-i", srcPath);
+      }
     } else {
       const srcPath = join(
         dir,
@@ -426,6 +449,133 @@ export async function renderGreenScreenMeme({
     // The clip's own sound (music, voice) is the meme's audio; the background
     // is a still image with nothing to contribute.
     if (clipHasAudio) {
+      args.push("-map", "1:a", "-c:a", "aac", "-b:a", "128k");
+    } else {
+      args.push("-an");
+    }
+
+    args.push(outPath);
+    await run(ffmpeg, args);
+    const buf = await readFile(outPath);
+    return { buffer: buf, width: w, height: h };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Talking Head Green Screen: an avatar clip, chroma-keyed and placed as a
+ * small inset over a looping demo video, with a caption on top.
+ *
+ * Relies on the avatar clip actually having been generated against a keyable
+ * background -- the caller (talkingHeadGreenScreen.ts) asks for that in the
+ * prompt it hands the avatar-render primitive, but a video model instructed
+ * to paint a green background is not the same guarantee as an actual studio
+ * green screen. A visible fringe around the inset is a real, known
+ * possibility, same caveat as Green Screen Meme's fixed key color.
+ *
+ * The avatar's own speech duration drives the total length -- it's the
+ * narration pacing that matters here, not the demo's -- so the demo loops
+ * (`-stream_loop -1`) to cover it rather than the other way around.
+ */
+export async function renderPictureInPicture({
+  demoUrl,
+  avatarUrl,
+  dimensions = "9:16",
+  pipScale = 0.42,
+  pipPosition = "bottom-right",
+  chromaColor = "0x00FF00",
+  similarity = 0.12,
+  blend = 0.06,
+  captionText = "",
+  captionStyle = "Classic",
+  fps = 30,
+}) {
+  if (!demoUrl) throw new Error("a demo video is required");
+  if (!avatarUrl) throw new Error("an avatar clip is required");
+
+  const ffmpeg = resolveFfmpeg();
+  const [w, h] = dimensionsFor(dimensions);
+  const dir = await mkdtemp(join(tmpdir(), "fe-pip-"));
+
+  try {
+    const demoRes = await fetch(demoUrl);
+    if (!demoRes.ok) throw new Error(`failed to fetch demo video: ${demoRes.status}`);
+    const demoPath = join(dir, "demo.mp4");
+    await writeFile(demoPath, Buffer.from(await demoRes.arrayBuffer()));
+
+    const avatarRes = await fetch(avatarUrl);
+    if (!avatarRes.ok) throw new Error(`failed to fetch avatar clip: ${avatarRes.status}`);
+    const avatarPath = join(dir, "avatar.mp4");
+    await writeFile(avatarPath, Buffer.from(await avatarRes.arrayBuffer()));
+
+    const probed = await probe(avatarPath);
+    const duration = Number(probed?.duration) || 15;
+    const avatarHasAudio = await hasAudio(avatarPath);
+
+    const pipW = Math.round(w * pipScale);
+    const pipH = Math.round(h * pipScale);
+    const margin = Math.round(w * 0.04);
+    const [pipX, pipY] = {
+      "bottom-right": [`W-w-${margin}`, `H-h-${margin}`],
+      "bottom-left": [`${margin}`, `H-h-${margin}`],
+      "top-right": [`W-w-${margin}`, `${margin}`],
+      "top-left": [`${margin}`, `${margin}`],
+    }[pipPosition] ?? [`W-w-${margin}`, `H-h-${margin}`];
+
+    const args = ["-y", "-stream_loop", "-1", "-i", demoPath, "-i", avatarPath];
+
+    const filters = [
+      `[0:v]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1[bg]`,
+      `[1:v]scale=${pipW}:${pipH}:force_original_aspect_ratio=increase,crop=${pipW}:${pipH},setsar=1,` +
+        `chromakey=${chromaColor}:${similarity}:${blend}[keyed]`,
+      `[bg][keyed]overlay=${pipX}:${pipY}:shortest=1,fps=${fps}[composited]`,
+    ];
+
+    let last = "[composited]";
+    let nextInputIndex = 2;
+    if (captionText.trim()) {
+      const capPng = await renderCaptionOverlay({
+        text: captionText,
+        style: captionStyle,
+        width: w,
+        height: h,
+      });
+      const capPath = join(dir, "cap.png");
+      await writeFile(capPath, capPng);
+      args.push("-loop", "1", "-i", capPath);
+      const capIdx = nextInputIndex++;
+      filters.push(`${last}[${capIdx}:v]overlay=0:0:shortest=1[capped]`);
+      last = "[capped]";
+    }
+
+    const outPath = join(dir, "out.mp4");
+    args.push(
+      "-filter_complex",
+      filters.join(";"),
+      "-map",
+      last,
+      "-t",
+      String(duration),
+      "-r",
+      String(fps),
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-profile:v",
+      "high",
+      "-preset",
+      "medium",
+      "-crf",
+      "20",
+      "-movflags",
+      "+faststart",
+    );
+
+    // The avatar's own voice is the ad's only audio; the looping demo footage
+    // contributes nothing and is muted by omission.
+    if (avatarHasAudio) {
       args.push("-map", "1:a", "-c:a", "aac", "-b:a", "128k");
     } else {
       args.push("-an");
@@ -770,4 +920,70 @@ export async function hasAudio(path) {
       }
     });
   });
+}
+
+/**
+ * Character Swap's own three small utilities, grouped here because all three
+ * exist for the same reason: neither Convex nor a fal model can tell you what
+ * an UPLOADED video actually contains, or hand you a plain frame or a plain
+ * audio track out of one -- that is real video surgery, same as everything
+ * else in this file.
+ */
+
+/** Downloads a URL to a temp file and reports duration and whether it has audio, so the workflow can cost and branch on the source's real length rather than a guess. */
+export async function inspectVideo(videoUrl) {
+  const ffprobe = process.env.FFPROBE_BIN || "ffprobe";
+  const dir = await mkdtemp(join(tmpdir(), "fe-inspect-"));
+  try {
+    const res = await fetch(videoUrl);
+    if (!res.ok) throw new Error(`failed to fetch video: ${res.status}`);
+    const srcPath = join(dir, "source.mp4");
+    await writeFile(srcPath, Buffer.from(await res.arrayBuffer()));
+
+    const [info, withAudio] = await Promise.all([probe(srcPath), hasAudio(srcPath)]);
+    return {
+      durationSec: Number(info?.duration) || 0,
+      width: info?.width ?? null,
+      height: info?.height ?? null,
+      hasAudio: withAudio,
+    };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** The first frame of a video, as a PNG -- Recreate mode composites a character into it, and verification reads one off the swap output to compare against the reference image. */
+export async function extractFirstFrame(videoUrl) {
+  const ffmpeg = resolveFfmpeg();
+  const dir = await mkdtemp(join(tmpdir(), "fe-frame-"));
+  try {
+    const res = await fetch(videoUrl);
+    if (!res.ok) throw new Error(`failed to fetch video: ${res.status}`);
+    const srcPath = join(dir, "source.mp4");
+    await writeFile(srcPath, Buffer.from(await res.arrayBuffer()));
+
+    const outPath = join(dir, "frame.png");
+    await run(ffmpeg, ["-y", "-i", srcPath, "-vframes", "1", outPath]);
+    return readFile(outPath);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** Just the audio track, as an mp3 -- ElevenLabs' voice changer takes a plain audio file, not a video container. */
+export async function extractAudioTrack(videoUrl) {
+  const ffmpeg = resolveFfmpeg();
+  const dir = await mkdtemp(join(tmpdir(), "fe-audio-"));
+  try {
+    const res = await fetch(videoUrl);
+    if (!res.ok) throw new Error(`failed to fetch video: ${res.status}`);
+    const srcPath = join(dir, "source.mp4");
+    await writeFile(srcPath, Buffer.from(await res.arrayBuffer()));
+
+    const outPath = join(dir, "audio.mp3");
+    await run(ffmpeg, ["-y", "-i", srcPath, "-vn", "-acodec", "libmp3lame", outPath]);
+    return readFile(outPath);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 }
