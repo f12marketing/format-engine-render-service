@@ -20,7 +20,7 @@ import { fileURLToPath } from "node:url";
 import puppeteer from "puppeteer-core";
 import { dimsFor, slideHtml } from "./carousel-templates/slide-dom.js";
 import { captionLayerHtml, dimensionsFor } from "./caption-styles.js";
-import { renderCustom, resolveFfmpeg, run } from "./video.mjs";
+import { renderCustom, renderSlideshow, resolveFfmpeg, run, setCaptionRenderer } from "./video.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = join(ROOT, "carousel-templates");
@@ -196,6 +196,38 @@ async function renderCaptionLayer({ text, style, width, height, position, scale 
   }
 }
 
+// video.mjs owns ffmpeg only; it cannot launch a browser itself, so the
+// caption renderer -- which needs Chrome -- is handed to it once at startup.
+setCaptionRenderer((opts) => renderCaptionLayer(opts));
+
+/** Slideshow: N generated stills, Ken Burns pan/zoom, a caption per slide. */
+async function renderSlideshowFormat(payload) {
+  const {
+    images = [],
+    captions = [],
+    dimensions = "9:16",
+    secondsPerImage = 3,
+    captionStyle = "Classic",
+  } = payload;
+
+  const { buffer, width, height } = await renderSlideshow({
+    images,
+    captions,
+    dimensions,
+    secondsPerImage,
+    captionStyle,
+  });
+
+  return {
+    ok: true,
+    width,
+    height,
+    files: [
+      { name: "output.mp4", contentType: "video/mp4", base64: buffer.toString("base64") },
+    ],
+  };
+}
+
 /** Custom: an upload, framed to a target ratio, with optional text and overlay. */
 async function renderCustomFormat(payload) {
   const {
@@ -306,6 +338,17 @@ const server = createServer(async (req, res) => {
         captionPosition: p.captionPosition ?? "center",
         textScale: p.textScale ?? 1.8,
       });
+      return json(res, 200, out);
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  if (req.method === "POST" && req.url === "/render/slideshow") {
+    try {
+      const payload = await readBody(req);
+      const out = await renderSlideshowFormat(payload);
       return json(res, 200, out);
     } catch (err) {
       console.error(String(err?.stack || err));

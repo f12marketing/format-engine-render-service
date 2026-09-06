@@ -197,6 +197,145 @@ export async function renderCustom({
   }
 }
 
+/**
+ * A Ken Burns slideshow: N stills, each held for a fixed duration with a slow
+ * centred zoom, an optional caption burned onto each one, concatenated into a
+ * single clip.
+ *
+ * Built as one filter_complex graph rather than N renders + a concat pass --
+ * fewer intermediate files, and one encode instead of N+1.
+ */
+let renderCaptionOverlay = null;
+export function setCaptionRenderer(fn) {
+  renderCaptionOverlay = fn;
+}
+
+export async function renderSlideshow({
+  images, // [{ url } | { base64, contentType }]
+  captions = [], // same length as images, "" for no caption on that slide
+  dimensions = "9:16",
+  secondsPerImage = 3,
+  captionStyle = "Classic",
+  fps = 30,
+}) {
+  if (!images?.length) throw new Error("at least one image is required");
+
+  const ffmpeg = resolveFfmpeg();
+  const [w, h] = dimensionsFor(dimensions);
+  const dir = await mkdtemp(join(tmpdir(), "fe-slideshow-"));
+  const frames = Math.round(secondsPerImage * fps);
+
+  try {
+    const args = ["-y"];
+    const filters = [];
+    const segmentLabels = [];
+    // Tracks the real ffmpeg input index as args are built. A slide and its
+    // caption are pushed back-to-back (image, then caption, then the next
+    // image...), not as two separate blocks -- an earlier version computed
+    // the caption's index as `images.length + i`, which assumes a block
+    // layout that this loop has never actually produced. That mismatch
+    // pulled the WRONG slide's caption onto every segment; only slide 0
+    // happened to render correctly, because at i=0 no prior inputs existed
+    // to be off by.
+    let nextInputIndex = 0;
+
+    for (let i = 0; i < images.length; i += 1) {
+      const img = images[i];
+      const ext = img.contentType ? extFor(img.contentType, "png") : "png";
+      const imgPath = join(dir, `slide_${i}.${ext}`);
+      if (img.base64) {
+        await writeFile(imgPath, Buffer.from(img.base64, "base64"));
+      } else if (img.url) {
+        const res = await fetch(img.url);
+        if (!res.ok) throw new Error(`failed to fetch slide ${i}: ${res.status}`);
+        await writeFile(imgPath, Buffer.from(await res.arrayBuffer()));
+      } else {
+        throw new Error(`slide ${i} has neither url nor base64`);
+      }
+
+      // No -t on the input. zoompan restarts its full d-frame zoom cycle for
+      // EVERY input frame it receives, not once overall -- so `-loop 1 -t N`
+      // here (N seconds of a looped image, at the demuxer's implicit ~25fps)
+      // fed roughly N*25 input frames through the filter, each triggering
+      // another full d-frame cycle. A 2-second slide came out 100 seconds
+      // long before this comment existed. The `trim` filter below is what
+      // actually bounds each segment; input duration must be left uncapped.
+      args.push("-loop", "1", "-i", imgPath);
+      const imgInputIndex = nextInputIndex++;
+
+      // Scale well past the frame before zoompan, or a source already near
+      // WxH runs out of resolution to zoom into and the shot judders.
+      // Centred zoom-in only: safe regardless of subject placement, unlike a
+      // pan, which can drift a generated image's subject off-frame.
+      filters.push(
+        `[${imgInputIndex}:v]scale=${w * 2}:${h * 2}:force_original_aspect_ratio=increase,` +
+          `crop=${w * 2}:${h * 2},` +
+          `zoompan=z='min(zoom+0.0012,1.3)':d=${frames}:` +
+          `x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${w}x${h}:fps=${fps},` +
+          `setsar=1,trim=duration=${secondsPerImage},setpts=PTS-STARTPTS[img${i}]`,
+      );
+
+      let label = `img${i}`;
+      const caption = captions[i];
+      if (caption && caption.trim()) {
+        const capPng = await renderCaptionOverlay({
+          text: caption,
+          style: captionStyle,
+          width: w,
+          height: h,
+        });
+        const capPath = join(dir, `cap_${i}.png`);
+        await writeFile(capPath, capPng);
+        args.push("-loop", "1", "-i", capPath);
+        const capInputIndex = nextInputIndex++;
+        // `overlay` defaults to running for as long as its LONGER input lasts
+        // (shortest=0), duplicating the shorter stream's last frame to keep
+        // pace -- so pairing a 2-second trimmed clip with an infinitely
+        // looped caption PNG produced a multi-minute output, not a 2-second
+        // one. `shortest=1` makes it stop when [label] (already trimmed)
+        // ends, which is what "one caption per slide" actually means.
+        filters.push(
+          `[${label}][${capInputIndex}:v]overlay=0:0:shortest=1[capped${i}]`,
+        );
+        label = `capped${i}`;
+      }
+      segmentLabels.push(`[${label}]`);
+    }
+
+    filters.push(`${segmentLabels.join("")}concat=n=${images.length}:v=1:a=0[outv]`);
+
+    const outPath = join(dir, "out.mp4");
+    args.push(
+      "-filter_complex",
+      filters.join(";"),
+      "-map",
+      "[outv]",
+      "-r",
+      String(fps),
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-profile:v",
+      "high",
+      "-preset",
+      "medium",
+      "-crf",
+      "20",
+      "-movflags",
+      "+faststart",
+      "-an",
+      outPath,
+    );
+
+    await run(ffmpeg, args);
+    const buf = await readFile(outPath);
+    return { buffer: buf, width: w, height: h };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
 /** Probe a source so the caller knows what it is holding. */
 export async function probe(path) {
   const ffprobe = process.env.FFPROBE_BIN || "ffprobe";
