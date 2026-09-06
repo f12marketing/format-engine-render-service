@@ -1,0 +1,309 @@
+/**
+ * The render service. Railway's job, and the first endpoint on it.
+ *
+ * This exists because a slide is HTML and CSS, so rasterising one needs a real
+ * browser -- which Convex actions are not, and which is the one thing Convex
+ * genuinely cannot do. It is `app/worker/export_carousel.mjs` with an HTTP
+ * wrapper: the same shared slide DOM, the same inlined CSS, the same true-size
+ * geometry, so preview and export agree by construction rather than by
+ * discipline.
+ *
+ * Runs locally with `node server.mjs` and deploys to Railway unchanged; the
+ * only difference is where CHROME_BIN points.
+ */
+
+import { createServer } from "node:http";
+import { readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+import puppeteer from "puppeteer-core";
+import { dimsFor, slideHtml } from "./carousel-templates/slide-dom.js";
+import { captionLayerHtml, dimensionsFor } from "./caption-styles.js";
+import { renderCustom, resolveFfmpeg, run } from "./video.mjs";
+
+const ROOT = dirname(fileURLToPath(import.meta.url));
+const TEMPLATES_DIR = join(ROOT, "carousel-templates");
+const PORT = Number(process.env.PORT || 4000);
+
+/** Drives the Chrome or Edge already installed rather than downloading ~170MB of Chromium. */
+function resolveBrowser() {
+  if (process.env.CHROME_BIN && existsSync(process.env.CHROME_BIN)) {
+    return process.env.CHROME_BIN;
+  }
+  const pf = process.env["ProgramFiles"] || "C:\\Program Files";
+  const pf86 = process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+  const local = process.env["LOCALAPPDATA"] || "";
+  const candidates = [
+    join(pf, "Google", "Chrome", "Application", "chrome.exe"),
+    join(pf86, "Google", "Chrome", "Application", "chrome.exe"),
+    local && join(local, "Google", "Chrome", "Application", "chrome.exe"),
+    join(pf, "Microsoft", "Edge", "Application", "msedge.exe"),
+    join(pf86, "Microsoft", "Edge", "Application", "msedge.exe"),
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+  ].filter(Boolean);
+  const found = candidates.find((p) => existsSync(p));
+  if (!found) {
+    throw new Error(
+      "no Chrome or Edge found for rendering -- install Google Chrome, or set " +
+        "CHROME_BIN to a Chrome/Edge executable path",
+    );
+  }
+  return found;
+}
+
+/**
+ * CSS is INLINED rather than linked. The generated page then has no external
+ * references at all, which sidesteps every origin quirk and leaves the HTML
+ * independently openable when a template needs debugging.
+ */
+async function loadCss(templateId) {
+  const base = await readFile(join(TEMPLATES_DIR, "_base.css"), "utf8");
+  const tpl = await readFile(join(TEMPLATES_DIR, `${templateId}.css`), "utf8");
+  return `${base}\n${tpl}`;
+}
+
+function buildHtml({ slides, templateId, dims, branding, footerLeft, css }) {
+  const [w, h] = dims;
+  const body = slides
+    .map((slide, i) =>
+      slideHtml({
+        slide,
+        index: i,
+        total: slides.length,
+        templateId,
+        dims,
+        branding,
+        footerLeft,
+      }),
+    )
+    .join("\n");
+
+  return `<!doctype html><html><head><meta charset="utf-8"><style>
+  ${css}
+  /* Each slide renders at true size, stacked, with Chrome told to break pages
+     exactly on slide boundaries -- so the PDF is one slide per page at the
+     deck's real dimensions. */
+  html, body { margin: 0; padding: 0; background: #fff; }
+  .slide { display: flex; break-after: page; page-break-after: always; }
+  .slide:last-child { break-after: auto; page-break-after: auto; }
+  @page { size: ${w}px ${h}px; margin: 0; }
+</style></head><body>\n${body}\n</body></html>`;
+}
+
+/** Renders a deck and returns every file as base64, for the caller to store. */
+async function renderCarousel(payload) {
+  const {
+    slides = [],
+    caption = "",
+    hashtags = [],
+    template = "bold-statement",
+    aspectRatio = "4:5",
+    branding,
+    footerLeft,
+  } = payload;
+
+  if (!slides.length) throw new Error("deck has no slides to render");
+  if (!existsSync(join(TEMPLATES_DIR, `${template}.css`))) {
+    throw new Error(`template '${template}' has no stylesheet`);
+  }
+
+  const dims = dimsFor(aspectRatio);
+  const css = await loadCss(template);
+  const html = buildHtml({ slides, templateId: template, dims, branding, footerLeft, css });
+
+  const browser = await puppeteer.launch({
+    executablePath: resolveBrowser(),
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"],
+  });
+
+  const files = [];
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width: dims[0], height: dims[1], deviceScaleFactor: 1 });
+    await page.setContent(html, { waitUntil: "load" });
+    await page.evaluateHandle("document.fonts.ready");
+
+    const handles = await page.$$(".slide");
+    if (handles.length !== slides.length) {
+      throw new Error(
+        `expected ${slides.length} slides in the page, found ${handles.length}`,
+      );
+    }
+
+    for (let i = 0; i < handles.length; i += 1) {
+      const name =
+        `${slides[i].slide_id || `slide_${String(i + 1).padStart(3, "0")}`}.png`;
+      const buf = await handles[i].screenshot({ type: "png" });
+      files.push({ name, contentType: "image/png", base64: Buffer.from(buf).toString("base64") });
+    }
+
+    const pdf = await page.pdf({
+      width: `${dims[0]}px`,
+      height: `${dims[1]}px`,
+      printBackground: true,
+      pageRanges: `1-${slides.length}`,
+      margin: { top: 0, right: 0, bottom: 0, left: 0 },
+    });
+    files.push({
+      name: "carousel.pdf",
+      contentType: "application/pdf",
+      base64: Buffer.from(pdf).toString("base64"),
+    });
+  } finally {
+    await browser.close();
+  }
+
+  const captionText =
+    `${[caption, "", hashtags.map((t) => `#${t}`).join(" ")].join("\n").trim()}\n`;
+  files.push({
+    name: "caption.txt",
+    contentType: "text/plain",
+    base64: Buffer.from(captionText, "utf8").toString("base64"),
+  });
+
+  return { ok: true, template, slideCount: slides.length, dims, files };
+}
+
+/**
+ * Draws a caption into a full-frame transparent PNG.
+ *
+ * Text goes through Chrome rather than ffmpeg's drawtext so it gets real
+ * typography, wrapping that behaves, and no escaping minefield for arbitrary
+ * user input -- and it reuses the browser this service already launches.
+ */
+async function renderCaptionLayer({ text, style, width, height, position }) {
+  const browser = await puppeteer.launch({
+    executablePath: resolveBrowser(),
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"],
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width, height, deviceScaleFactor: 1 });
+    await page.setContent(
+      captionLayerHtml({ text, style, width, height, position }),
+      { waitUntil: "load" },
+    );
+    await page.evaluateHandle("document.fonts.ready");
+    // omitBackground is what makes this an overlay rather than a black card.
+    return Buffer.from(await page.screenshot({ type: "png", omitBackground: true }));
+  } finally {
+    await browser.close();
+  }
+}
+
+/** Custom: an upload, framed to a target ratio, with optional text and overlay. */
+async function renderCustomFormat(payload) {
+  const {
+    source,
+    dimensions = "9:16",
+    fit = "contain",
+    text = "",
+    captionStyle = "Classic",
+    captionPosition = "bottom",
+    overlay = null,
+    durationSec = 5,
+  } = payload;
+
+  const [w, h] = dimensionsFor(dimensions);
+
+  const captionPng = text.trim()
+    ? await renderCaptionLayer({
+        text,
+        style: captionStyle,
+        width: w,
+        height: h,
+        position: captionPosition,
+      })
+    : null;
+
+  const { buffer, width, height } = await renderCustom({
+    source,
+    dimensions,
+    fit,
+    durationSec,
+    captionPng,
+    overlay,
+  });
+
+  return {
+    ok: true,
+    width,
+    height,
+    files: [
+      {
+        name: "output.mp4",
+        contentType: "video/mp4",
+        base64: buffer.toString("base64"),
+      },
+    ],
+  };
+}
+
+// ---- HTTP -------------------------------------------------------------------
+
+function json(res, status, body) {
+  const payload = JSON.stringify(body);
+  res.writeHead(status, {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(payload),
+  });
+  res.end(payload);
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(chunk);
+  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+}
+
+const server = createServer(async (req, res) => {
+  if (req.method === "GET" && req.url === "/health") {
+    let ffmpegOk = false;
+    try {
+      await run(resolveFfmpeg(), ["-version"]);
+      ffmpegOk = true;
+    } catch {
+      ffmpegOk = false;
+    }
+    return json(res, 200, {
+      ok: true,
+      browser: (() => {
+        try { return resolveBrowser(); } catch { return null; }
+      })(),
+      ffmpeg: ffmpegOk,
+    });
+  }
+
+  if (req.method === "POST" && req.url === "/render/carousel") {
+    try {
+      const payload = await readBody(req);
+      const out = await renderCarousel(payload);
+      return json(res, 200, out);
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  if (req.method === "POST" && req.url === "/render/custom") {
+    try {
+      const payload = await readBody(req);
+      const out = await renderCustomFormat(payload);
+      return json(res, 200, out);
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  json(res, 404, { ok: false, error: "not found" });
+});
+
+server.listen(PORT, () => {
+  console.log(`render service on http://localhost:${PORT}`);
+});

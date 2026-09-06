@@ -1,0 +1,67 @@
+/* Minimal Grid -- white, hairline rules top and bottom, small-caps kicker and a
+   lot of air. The restrained one: nothing competes with the words, which is
+   what makes it safe for corporate and B2B decks where the other templates
+   would read as too loud. */
+
+.slide[data-template="minimal-grid"] {
+  background: #ffffff;
+  color: #14161a;
+  padding: 4.2em;
+}
+
+.slide[data-template="minimal-grid"] .slide-inner {
+  justify-content: center;
+  gap: 1.1em;
+  border-top: 1px solid rgba(20, 22, 26, 0.14);
+  border-bottom: 1px solid rgba(20, 22, 26, 0.14);
+  padding: 2.4em 0;
+}
+
+.slide[data-template="minimal-grid"] .slide-kicker {
+  font-size: 1.05em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.26em;
+  color: var(--ct-accent);
+}
+
+.slide[data-template="minimal-grid"] .slide-headline {
+  font-size: 4em;
+  line-height: 1.12;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  max-width: 15em;
+}
+
+.slide[data-template="minimal-grid"][data-role="hook"] .slide-headline { font-size: 5em; font-weight: 700; }
+
+.slide[data-template="minimal-grid"] .slide-body {
+  font-size: 1.75em;
+  line-height: 1.55;
+  color: #5b626b;
+  max-width: 24em;
+}
+
+.slide[data-template="minimal-grid"] .slide-cue {
+  font-size: 1.25em;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: rgba(20, 22, 26, 0.34);
+}
+
+.slide[data-template="minimal-grid"] .slide-meta {
+  font-size: 1.05em;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: rgba(20, 22, 26, 0.3);
+  padding-top: 1.6em;
+}
+
+/* CTA gets the accent as a solid footer bar -- the only moment this template
+   raises its voice. */
+.slide[data-template="minimal-grid"][data-role="cta"] .slide-inner {
+  border-color: var(--ct-accent);
+  border-top-width: 0.28em;
+}
+.slide[data-template="minimal-grid"][data-role="cta"] .slide-headline { color: var(--ct-accent); }

@@ -1,0 +1,90 @@
+/* Carousel slide geometry. Shared by every template and by both consumers of
+   these files: the live picker/preview in public/project.html, and (Phase C)
+   the server-side still renderer. Templates layer type, colour and spacing on
+   top; nothing here should carry a visual opinion.
+
+   WYSIWYG is guaranteed by construction rather than by keeping two renderers in
+   sync: a slide is always laid out at its TRUE pixel size (1080x1350 for 4:5,
+   etc.) and the preview merely CSS-scales that down to fit its box. What you
+   see in the browser is the same layout the exporter rasterises.
+
+   Sizing unit: .slide gets an inline font-size of width/67.5 (so 16px at a
+   1080px-wide slide) and every template expresses type and spacing in `em`.
+   That makes templates resolution-independent -- the same CSS renders correctly
+   at 1080x1350 and at 1920x1080 without a single media query. */
+
+.slide {
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  /* Fallbacks only. The real values come from settings.branding, injected as
+     inline custom properties by the page that renders the slide. */
+  --ct-accent: #6ea8fe;
+  --ct-font: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-family: var(--ct-font);
+  /* Belt and braces for the exporter: a slide must never inherit a page
+     background, and text must never be selected into a screenshot. */
+  background: #fff;
+  color: #111;
+  -webkit-font-smoothing: antialiased;
+}
+
+.slide *,
+.slide *::before,
+.slide *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* The copy stack. justify-content is what templates use to move the block to
+   the top, middle or bottom of the slide. min-height:0 lets overflow actually
+   overflow, which is what the picker's overflow detection measures. */
+.slide-inner {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  gap: 0.75em;
+  position: relative;
+  z-index: 1;
+}
+
+.slide-kicker   { display: block; }
+.slide-headline { display: block; font-weight: 700; text-wrap: balance; }
+.slide-body     { display: block; }
+.slide-cue      { display: block; }
+
+/* An empty field must not leave a gap behind -- the LLM legitimately returns
+   "" for kicker and body, and the last slide always has an empty swipe cue. */
+.slide-kicker:empty,
+.slide-body:empty,
+.slide-cue:empty { display: none; }
+
+/* Footer rail: slide counter and any brand mark.
+   The margin is load-bearing, not decoration. Templates that bottom-align their
+   copy (numbered-list) let .slide-inner grow to the footer's top edge, so
+   without a floor here the last line of copy -- usually the swipe cue -- ends up
+   sitting directly on the brand mark and page number. Centred templates never
+   showed it, which is exactly why it survived until decks were rendered and
+   read. Individual templates may add more, never less. */
+.slide-meta {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1em;
+  margin-top: 2.2em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- preview scaffolding (browser only; the exporter renders .slide alone) --
+   .slide-frame is the fixed-size viewport; .slide-scaler carries the transform
+   that shrinks a true-size slide into it. */
+.slide-frame {
+  overflow: hidden;
+  border-radius: 10px;
+  flex: none;
+  background: #000;
+}
+.slide-scaler { transform-origin: top left; }

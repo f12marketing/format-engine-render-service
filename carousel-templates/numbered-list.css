@@ -1,0 +1,81 @@
+/* Numbered List -- the slide number is the design, set enormous and pale behind
+   the copy. Built for listicles, where the reader's question on every slide is
+   "which one is this". The hook and CTA suppress the numeral, since neither is
+   a list item. */
+
+.slide[data-template="numbered-list"] {
+  background: #ffffff;
+  color: #14161a;
+  padding: 4.5em;
+}
+
+/* content comes from the data-index attribute the renderer sets, so the numeral
+   needs no extra DOM node. */
+.slide[data-template="numbered-list"]::before {
+  content: attr(data-index);
+  position: absolute;
+  top: -0.12em;
+  right: 0.1em;
+  font-size: 16em;
+  font-weight: 800;
+  line-height: 1;
+  color: var(--ct-accent);
+  opacity: 0.13;
+  z-index: 0;
+}
+.slide[data-template="numbered-list"][data-role="hook"]::before,
+.slide[data-template="numbered-list"][data-role="cta"]::before { content: none; }
+
+/* List items hang off the bottom, under their numeral. The hook and CTA have no
+   numeral, so bottom-aligning them just leaves a dead half-slide -- they centre
+   instead. */
+.slide[data-template="numbered-list"] .slide-inner { justify-content: flex-end; gap: 0.7em; }
+.slide[data-template="numbered-list"][data-role="hook"] .slide-inner,
+.slide[data-template="numbered-list"][data-role="cta"] .slide-inner { justify-content: center; }
+
+.slide[data-template="numbered-list"] .slide-kicker {
+  font-size: 1.25em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--ct-accent);
+}
+
+.slide[data-template="numbered-list"] .slide-headline {
+  font-size: 4.6em;
+  line-height: 1.06;
+  font-weight: 800;
+  letter-spacing: -0.028em;
+}
+
+.slide[data-template="numbered-list"][data-role="hook"] .slide-headline { font-size: 6em; }
+
+.slide[data-template="numbered-list"] .slide-body {
+  font-size: 1.9em;
+  line-height: 1.45;
+  color: #4a5058;
+  max-width: 22em;
+}
+
+.slide[data-template="numbered-list"] .slide-cue {
+  font-size: 1.4em;
+  font-weight: 600;
+  color: rgba(20, 22, 26, 0.38);
+  margin-top: 0.35em;
+}
+
+.slide[data-template="numbered-list"] .slide-meta {
+  font-size: 1.15em;
+  font-weight: 600;
+  color: rgba(20, 22, 26, 0.35);
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+.slide[data-template="numbered-list"][data-role="cta"] {
+  background: #14161a;
+  color: #ffffff;
+}
+.slide[data-template="numbered-list"][data-role="cta"] .slide-headline { color: var(--ct-accent); }
+.slide[data-template="numbered-list"][data-role="cta"] .slide-body { color: rgba(255, 255, 255, 0.7); }
+.slide[data-template="numbered-list"][data-role="cta"] .slide-meta { color: rgba(255, 255, 255, 0.4); }

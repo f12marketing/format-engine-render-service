@@ -1,0 +1,10 @@
+{
+  "name": "format-engine-render-service",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Headless-Chrome render service: the one thing Convex cannot do.",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node server.mjs" },
+  "dependencies": { "puppeteer-core": "^25.10.0" }
+}

@@ -1,0 +1,60 @@
+/* Bold Statement -- the whole slide is the brand colour and the headline is
+   enormous. Made for opinionated, single-claim decks. The hook gets a bigger
+   size still, and the CTA inverts to a light ground so the ask reads as a
+   different kind of slide rather than one more statement. */
+
+.slide[data-template="bold-statement"] {
+  background: var(--ct-accent);
+  color: var(--ct-on-accent);
+  padding: 4.5em;
+}
+
+.slide[data-template="bold-statement"] .slide-inner { justify-content: center; gap: 0.9em; }
+
+.slide[data-template="bold-statement"] .slide-kicker {
+  font-size: 1.3em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  opacity: 0.72;
+}
+
+.slide[data-template="bold-statement"] .slide-headline {
+  font-size: 5.4em;
+  line-height: 0.95;
+  font-weight: 800;
+  letter-spacing: -0.03em;
+}
+
+/* The hook is the only slide most people ever see -- give it the extra size. */
+.slide[data-template="bold-statement"][data-role="hook"] .slide-headline { font-size: 6.8em; }
+
+.slide[data-template="bold-statement"] .slide-body {
+  font-size: 1.95em;
+  line-height: 1.35;
+  opacity: 0.88;
+  max-width: 21em;
+}
+
+.slide[data-template="bold-statement"] .slide-cue {
+  font-size: 1.5em;
+  font-weight: 600;
+  opacity: 0.62;
+  margin-top: 0.4em;
+}
+
+.slide[data-template="bold-statement"] .slide-meta {
+  font-size: 1.25em;
+  font-weight: 600;
+  opacity: 0.55;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+}
+
+/* CTA inverts: the ask should not look like another claim. */
+.slide[data-template="bold-statement"][data-role="cta"] {
+  background: #faf9f7;
+  color: #14161a;
+}
+.slide[data-template="bold-statement"][data-role="cta"] .slide-headline { color: var(--ct-accent); }
+.slide[data-template="bold-statement"][data-role="cta"] .slide-body { opacity: 0.75; }

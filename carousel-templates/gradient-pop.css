@@ -1,0 +1,75 @@
+/* Gradient Pop -- a soft two-stop gradient built from the brand accent, with
+   the copy floating in a white card inset from the edges. The card is what
+   keeps text legible over colour, and it gives the deck a friendlier, more
+   consumer feel than the flat templates. */
+
+.slide[data-template="gradient-pop"] {
+  /* color-mix keeps the whole gradient derived from the one brand colour, so a
+     user changing the accent restyles the template coherently instead of
+     leaving a hardcoded second stop behind. */
+  background:
+    linear-gradient(145deg,
+      var(--ct-accent) 0%,
+      color-mix(in srgb, var(--ct-accent) 55%, #ff8ac1) 55%,
+      color-mix(in srgb, var(--ct-accent) 25%, #ffd166) 100%);
+  color: #14161a;
+  padding: 3.2em;
+}
+
+/* The floating card. It is the flex column itself, so the copy stack and the
+   footer rail both sit inside it. */
+.slide[data-template="gradient-pop"] .slide-inner {
+  background: #ffffff;
+  border-radius: 2em;
+  padding: 3.4em;
+  justify-content: center;
+  gap: 0.8em;
+  box-shadow: 0 1.5em 4em rgba(0, 0, 0, 0.16);
+}
+
+.slide[data-template="gradient-pop"] .slide-kicker {
+  font-size: 1.2em;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.15em;
+  color: var(--ct-accent);
+}
+
+.slide[data-template="gradient-pop"] .slide-headline {
+  font-size: 4.2em;
+  line-height: 1.08;
+  font-weight: 800;
+  letter-spacing: -0.025em;
+}
+
+.slide[data-template="gradient-pop"][data-role="hook"] .slide-headline { font-size: 5.2em; }
+
+.slide[data-template="gradient-pop"] .slide-body {
+  font-size: 1.8em;
+  line-height: 1.45;
+  color: #4a5058;
+  max-width: 22em;
+}
+
+.slide[data-template="gradient-pop"] .slide-cue {
+  font-size: 1.35em;
+  font-weight: 600;
+  color: var(--ct-accent);
+  margin-top: 0.3em;
+}
+
+/* Footer sits on the gradient, outside the card. */
+.slide[data-template="gradient-pop"] .slide-meta {
+  font-size: 1.15em;
+  font-weight: 700;
+  color: rgba(255, 255, 255, 0.85);
+  text-transform: uppercase;
+  letter-spacing: 0.12em;
+  padding: 1.1em 0.6em 0;
+}
+
+.slide[data-template="gradient-pop"][data-role="cta"] .slide-inner {
+  background: #14161a;
+}
+.slide[data-template="gradient-pop"][data-role="cta"] .slide-headline { color: #ffffff; }
+.slide[data-template="gradient-pop"][data-role="cta"] .slide-body { color: rgba(255, 255, 255, 0.72); }

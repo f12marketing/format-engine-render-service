@@ -1,0 +1,51 @@
+{
+  "_comment": [
+    "Carousel slide templates. There are no AI-generated visuals in carousel mode,",
+    "so a template IS the entire visual -- this list is the whole look-and-feel",
+    "surface of the feature.",
+    "",
+    "Each entry's `id` maps to `<id>.css` in this folder, layered on top of",
+    "_base.css (which owns geometry and the slide DOM; templates own type,",
+    "colour and spacing only). Every template's CSS is scoped to",
+    "[data-template=\"<id>\"], so the picker can render live thumbnails of all of",
+    "them side by side with all stylesheets loaded at once.",
+    "",
+    "Adding a template = one CSS file + one entry here. Nothing else.",
+    "",
+    "Every template is built to hold the SAME copy budget (CAROUSEL_LIMITS in",
+    "lib/validate.js), which is what makes switching templates after the copy is",
+    "written a free, safe operation."
+  ],
+  "templates": [
+    {
+      "id": "bold-statement",
+      "name": "Bold Statement",
+      "blurb": "Huge type on flat colour. Punchy and opinionated."
+    },
+    {
+      "id": "editorial-serif",
+      "name": "Editorial Serif",
+      "blurb": "Cream ground, serif headline, wide margins. Thought leadership."
+    },
+    {
+      "id": "dark-mode",
+      "name": "Dark Mode",
+      "blurb": "Near-black with a bright keyline. Reads native to a dev audience."
+    },
+    {
+      "id": "numbered-list",
+      "name": "Numbered List",
+      "blurb": "Oversized slide number as the design. Built for listicles."
+    },
+    {
+      "id": "gradient-pop",
+      "name": "Gradient Pop",
+      "blurb": "Soft gradient behind a floating card. Consumer and lifestyle."
+    },
+    {
+      "id": "minimal-grid",
+      "name": "Minimal Grid",
+      "blurb": "White, hairline rules, generous whitespace. Corporate and B2B."
+    }
+  ]
+}

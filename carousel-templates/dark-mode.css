@@ -1,0 +1,64 @@
+/* Dark Mode -- near-black ground, a bright accent keyline down the left edge,
+   monospace kicker. Reads native to a developer/technical audience, and it is
+   the one template that looks correct next to a code screenshot. */
+
+.slide[data-template="dark-mode"] {
+  background: #0b0d10;
+  color: #e9edf3;
+  padding: 4.5em 4.5em 4.5em 5em;
+}
+
+/* The keyline. Sits behind the copy (z-index 1 on .slide-inner in _base.css). */
+.slide[data-template="dark-mode"]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 0.75em;
+  background: var(--ct-accent);
+}
+
+.slide[data-template="dark-mode"] .slide-inner { justify-content: center; gap: 0.85em; }
+
+.slide[data-template="dark-mode"] .slide-kicker {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 1.2em;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--ct-accent);
+}
+
+.slide[data-template="dark-mode"] .slide-headline {
+  font-size: 4.7em;
+  line-height: 1.04;
+  font-weight: 700;
+  letter-spacing: -0.025em;
+}
+
+.slide[data-template="dark-mode"][data-role="hook"] .slide-headline { font-size: 5.9em; }
+
+.slide[data-template="dark-mode"] .slide-body {
+  font-size: 1.85em;
+  line-height: 1.45;
+  color: #9aa4b2;
+  max-width: 23em;
+}
+
+.slide[data-template="dark-mode"] .slide-cue {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 1.3em;
+  color: rgba(233, 237, 243, 0.4);
+  margin-top: 0.3em;
+}
+
+.slide[data-template="dark-mode"] .slide-meta {
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 1.15em;
+  color: rgba(233, 237, 243, 0.35);
+}
+
+/* CTA: the accent floods the keyline into a full underline bar so the last
+   slide reads as a button rather than a statement. */
+.slide[data-template="dark-mode"][data-role="cta"]::before { width: 100%; height: 0.75em; bottom: auto; }
+.slide[data-template="dark-mode"][data-role="cta"] .slide-headline { color: var(--ct-accent); }

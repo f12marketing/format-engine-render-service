@@ -1,0 +1,57 @@
+/* Editorial Serif -- cream stock, serif headline, a hairline rule and a lot of
+   margin. Reads like a printed essay rather than a post, which is exactly what
+   suits thought-leadership copy. Deliberately uses a system serif stack (no
+   webfont) so the server-side exporter renders identically with no network. */
+
+.slide[data-template="editorial-serif"] {
+  background: #f5f0e6;
+  color: #221f1a;
+  padding: 5em 4.5em;
+}
+
+.slide[data-template="editorial-serif"] .slide-inner { justify-content: center; gap: 1em; }
+
+.slide[data-template="editorial-serif"] .slide-kicker {
+  font-size: 1.15em;
+  text-transform: uppercase;
+  letter-spacing: 0.22em;
+  color: var(--ct-accent);
+  font-weight: 600;
+}
+
+.slide[data-template="editorial-serif"] .slide-headline {
+  font-family: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  font-size: 4.4em;
+  line-height: 1.08;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+}
+
+.slide[data-template="editorial-serif"][data-role="hook"] .slide-headline { font-size: 5.4em; }
+
+/* The rule under the headline is the template's one piece of ornament -- it
+   sits between headline and body, so it only appears when there is a body. */
+.slide[data-template="editorial-serif"] .slide-body {
+  font-size: 1.85em;
+  line-height: 1.5;
+  max-width: 24em;
+  padding-top: 0.9em;
+  border-top: 1px solid rgba(34, 31, 26, 0.22);
+  color: #3d382f;
+}
+
+.slide[data-template="editorial-serif"] .slide-cue {
+  font-family: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  font-size: 1.5em;
+  font-style: italic;
+  color: rgba(34, 31, 26, 0.5);
+}
+
+.slide[data-template="editorial-serif"] .slide-meta {
+  font-size: 1.1em;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: rgba(34, 31, 26, 0.42);
+}
+
+.slide[data-template="editorial-serif"][data-role="cta"] .slide-headline { color: var(--ct-accent); }
