@@ -82,20 +82,28 @@ export function captionLayerHtml({
   width,
   height,
   position = "bottom",
+  /**
+   * Multiplier on the base type size. A caption sits under the action at 1;
+   * Wall of Text *is* the action, so it runs around 1.8 and fills the frame.
+   * One layer renderer either way -- the difference is a number, not a second
+   * code path.
+   */
+  scale = 1,
+  background = null,
 }) {
   const css = STYLE_CSS[style] ?? STYLE_CSS.Classic;
   const align =
     position === "top" ? "flex-start" : position === "center" ? "center" : "flex-end";
 
   return `<!doctype html><html><head><meta charset="utf-8"><style>
-  html, body { margin: 0; padding: 0; background: transparent; }
+  html, body { margin: 0; padding: 0; background: ${background ?? "transparent"}; }
   .frame {
     width: ${width}px; height: ${height}px;
     display: flex; align-items: ${align}; justify-content: center;
     /* 8% inset all round: the platform-safe area for vertical video. */
     padding: ${Math.round(height * 0.08)}px ${Math.round(width * 0.08)}px;
     box-sizing: border-box;
-    font-size: ${(width / 22).toFixed(2)}px;
+    font-size: ${((width / 22) * scale).toFixed(2)}px;
   }
   .caption {
     max-width: 100%;

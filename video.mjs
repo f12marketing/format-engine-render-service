@@ -66,29 +66,50 @@ export async function renderCustom({
   dimensions = "9:16",
   /** "contain" letterboxes and keeps everything; "cover" crops to fill. */
   fit = "contain",
+  /** Used instead of a source when there is no upload, e.g. Wall of Text. */
+  backgroundColor = null,
   durationSec = 5,
   captionPng, // Buffer | null -- a full-frame transparent overlay
   overlay, // { base64, contentType } | null
   fps = 30,
 }) {
-  if (!source?.base64) throw new Error("a source image or video is required");
+  // Wall of Text has no upload at all: the background is generated, and the
+  // text layer is the entire picture. Same compositing path, one fewer input.
+  const generated = !source?.base64;
+  if (generated && !backgroundColor) {
+    throw new Error("a source upload or a backgroundColor is required");
+  }
 
   const ffmpeg = resolveFfmpeg();
   const [w, h] = dimensionsFor(dimensions);
   const dir = await mkdtemp(join(tmpdir(), "fe-custom-"));
 
   try {
-    const isVideo = (source.contentType ?? "").startsWith("video/");
-    const srcPath = join(dir, `source.${extFor(source.contentType, isVideo ? "mp4" : "png")}`);
-    await writeFile(srcPath, Buffer.from(source.base64, "base64"));
-
+    const isVideo = !generated && (source.contentType ?? "").startsWith("video/");
     const args = ["-y"];
 
-    // A still becomes a clip of the requested length; a video keeps its own.
-    if (isVideo) {
-      args.push("-i", srcPath);
+    if (generated) {
+      // lavfi synthesises the background, so no file is written at all.
+      args.push(
+        "-f",
+        "lavfi",
+        "-t",
+        String(durationSec),
+        "-i",
+        `color=c=${backgroundColor}:s=${w}x${h}:r=${fps}`,
+      );
     } else {
-      args.push("-loop", "1", "-t", String(durationSec), "-i", srcPath);
+      const srcPath = join(
+        dir,
+        `source.${extFor(source.contentType, isVideo ? "mp4" : "png")}`,
+      );
+      await writeFile(srcPath, Buffer.from(source.base64, "base64"));
+      // A still becomes a clip of the requested length; a video keeps its own.
+      if (isVideo) {
+        args.push("-i", srcPath);
+      } else {
+        args.push("-loop", "1", "-t", String(durationSec), "-i", srcPath);
+      }
     }
 
     const filters = [];
@@ -102,7 +123,9 @@ export async function renderCustom({
     // setsar matters in both: without it some sources carry a pixel aspect
     // ratio that makes players letterbox the result a second time.
     filters.push(
-      fit === "cover"
+      generated
+        ? `${last}setsar=1[base]`
+        : fit === "cover"
         ? `${last}scale=${w}:${h}:force_original_aspect_ratio=increase,` +
             `crop=${w}:${h},setsar=1[base]`
         : `${last}scale=${w}:${h}:force_original_aspect_ratio=decrease,` +

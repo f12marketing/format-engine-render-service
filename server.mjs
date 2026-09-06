@@ -175,7 +175,7 @@ async function renderCarousel(payload) {
  * typography, wrapping that behaves, and no escaping minefield for arbitrary
  * user input -- and it reuses the browser this service already launches.
  */
-async function renderCaptionLayer({ text, style, width, height, position }) {
+async function renderCaptionLayer({ text, style, width, height, position, scale }) {
   const browser = await puppeteer.launch({
     executablePath: resolveBrowser(),
     headless: true,
@@ -185,7 +185,7 @@ async function renderCaptionLayer({ text, style, width, height, position }) {
     const page = await browser.newPage();
     await page.setViewport({ width, height, deviceScaleFactor: 1 });
     await page.setContent(
-      captionLayerHtml({ text, style, width, height, position }),
+      captionLayerHtml({ text, style, width, height, position, scale }),
       { waitUntil: "load" },
     );
     await page.evaluateHandle("document.fonts.ready");
@@ -202,6 +202,8 @@ async function renderCustomFormat(payload) {
     source,
     dimensions = "9:16",
     fit = "contain",
+    backgroundColor = null,
+    textScale = 1,
     text = "",
     captionStyle = "Classic",
     captionPosition = "bottom",
@@ -218,6 +220,7 @@ async function renderCustomFormat(payload) {
         width: w,
         height: h,
         position: captionPosition,
+        scale: textScale,
       })
     : null;
 
@@ -225,6 +228,7 @@ async function renderCustomFormat(payload) {
     source,
     dimensions,
     fit,
+    backgroundColor,
     durationSec,
     captionPng,
     overlay,
@@ -283,6 +287,25 @@ const server = createServer(async (req, res) => {
     try {
       const payload = await readBody(req);
       const out = await renderCarousel(payload);
+      return json(res, 200, out);
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  if (req.method === "POST" && req.url === "/render/wall-of-text") {
+    try {
+      const p = await readBody(req);
+      // No upload, a generated ground, and type large enough to be the subject
+      // rather than a caption on one.
+      const out = await renderCustomFormat({
+        ...p,
+        source: null,
+        backgroundColor: p.backgroundColor ?? "#111111",
+        captionPosition: p.captionPosition ?? "center",
+        textScale: p.textScale ?? 1.8,
+      });
       return json(res, 200, out);
     } catch (err) {
       console.error(String(err?.stack || err));
