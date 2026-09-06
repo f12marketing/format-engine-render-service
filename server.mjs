@@ -26,6 +26,10 @@ import {
   renderVideoAnimation,
   renderVideoHookDemo,
   renderGreenScreenMeme,
+  renderPictureInPicture,
+  inspectVideo,
+  extractFirstFrame,
+  extractAudioTrack,
   resolveFfmpeg,
   run,
   setCaptionRenderer,
@@ -297,6 +301,30 @@ async function renderGreenScreenMemeFormat(payload) {
   return uploadResult(buffer, width, height, uploadUrl);
 }
 
+/** Talking Head Green Screen: avatar keyed into a corner of a looping demo. */
+async function renderPictureInPictureFormat(payload) {
+  const {
+    demoUrl,
+    avatarUrl,
+    dimensions = "9:16",
+    pipScale,
+    pipPosition,
+    captionText = "",
+    captionStyle = "Classic",
+    uploadUrl,
+  } = payload;
+  const { buffer, width, height } = await renderPictureInPicture({
+    demoUrl,
+    avatarUrl,
+    dimensions,
+    pipScale,
+    pipPosition,
+    captionText,
+    captionStyle,
+  });
+  return uploadResult(buffer, width, height, uploadUrl);
+}
+
 /** Shared by every endpoint whose output should go straight to storage. */
 async function uploadResult(buffer, width, height, uploadUrl) {
   if (uploadUrl) {
@@ -319,10 +347,18 @@ async function uploadResult(buffer, width, height, uploadUrl) {
   };
 }
 
-/** Custom: an upload, framed to a target ratio, with optional text and overlay. */
+/**
+ * Custom: an upload, framed to a target ratio, with optional text and
+ * overlay. Also doubles as the caption-burn step for every avatar format --
+ * "Custom" is already "any video, cover-fit and captioned", which is
+ * precisely what a talking-head clip needs with no format-specific renderer
+ * of its own.
+ */
 async function renderCustomFormat(payload) {
   const {
     source,
+    sourceUrl = null,
+    sourceIsVideo = true,
     dimensions = "9:16",
     fit = "contain",
     backgroundColor = null,
@@ -332,6 +368,7 @@ async function renderCustomFormat(payload) {
     captionPosition = "bottom",
     overlay = null,
     durationSec = 5,
+    uploadUrl,
   } = payload;
 
   const [w, h] = dimensionsFor(dimensions);
@@ -349,6 +386,8 @@ async function renderCustomFormat(payload) {
 
   const { buffer, width, height } = await renderCustom({
     source,
+    sourceUrl,
+    sourceIsVideo,
     dimensions,
     fit,
     backgroundColor,
@@ -357,18 +396,7 @@ async function renderCustomFormat(payload) {
     overlay,
   });
 
-  return {
-    ok: true,
-    width,
-    height,
-    files: [
-      {
-        name: "output.mp4",
-        contentType: "video/mp4",
-        base64: buffer.toString("base64"),
-      },
-    ],
-  };
+  return uploadResult(buffer, width, height, uploadUrl);
 }
 
 // ---- HTTP -------------------------------------------------------------------
@@ -480,11 +508,68 @@ const server = createServer(async (req, res) => {
     }
   }
 
+  if (req.method === "POST" && req.url === "/render/picture-in-picture") {
+    try {
+      const payload = await readBody(req);
+      const out = await renderPictureInPictureFormat(payload);
+      return json(res, 200, out);
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
   if (req.method === "POST" && req.url === "/render/custom") {
     try {
       const payload = await readBody(req);
       const out = await renderCustomFormat(payload);
       return json(res, 200, out);
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  // ---- Character Swap's own small utilities ------------------------------
+  // Small enough to return base64 directly -- a single frame or a short
+  // audio track never approaches Convex's 16MB function-argument ceiling the
+  // way a rendered video does, so none of these need the uploadUrl dance.
+
+  if (req.method === "POST" && req.url === "/inspect/video") {
+    try {
+      const { videoUrl } = await readBody(req);
+      const out = await inspectVideo(videoUrl);
+      return json(res, 200, { ok: true, ...out });
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  if (req.method === "POST" && req.url === "/frame/first") {
+    try {
+      const { videoUrl } = await readBody(req);
+      const buffer = await extractFirstFrame(videoUrl);
+      return json(res, 200, {
+        ok: true,
+        contentType: "image/png",
+        base64: buffer.toString("base64"),
+      });
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  if (req.method === "POST" && req.url === "/extract/audio") {
+    try {
+      const { videoUrl } = await readBody(req);
+      const buffer = await extractAudioTrack(videoUrl);
+      return json(res, 200, {
+        ok: true,
+        contentType: "audio/mpeg",
+        base64: buffer.toString("base64"),
+      });
     } catch (err) {
       console.error(String(err?.stack || err));
       return json(res, 500, { ok: false, error: String(err?.message || err) });
