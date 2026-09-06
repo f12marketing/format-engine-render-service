@@ -20,7 +20,14 @@ import { fileURLToPath } from "node:url";
 import puppeteer from "puppeteer-core";
 import { dimsFor, slideHtml } from "./carousel-templates/slide-dom.js";
 import { captionLayerHtml, dimensionsFor } from "./caption-styles.js";
-import { renderCustom, renderSlideshow, resolveFfmpeg, run, setCaptionRenderer } from "./video.mjs";
+import {
+  renderCustom,
+  renderSlideshow,
+  renderVideoAnimation,
+  resolveFfmpeg,
+  run,
+  setCaptionRenderer,
+} from "./video.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = join(ROOT, "carousel-templates");
@@ -228,6 +235,43 @@ async function renderSlideshowFormat(payload) {
   };
 }
 
+/**
+ * Video Animation: N clips, each with optional dialogue audio and caption.
+ *
+ * A stitched output routinely exceeds Convex's 16MB function-argument limit
+ * as base64, so this uploads the finished bytes directly to the signed URL
+ * the caller generated -- the same pattern the browser's own UploadField
+ * uses, just with this service standing in for a person. `uploadUrl` is
+ * required in practice; the base64 fallback exists only so this endpoint
+ * stays curl-able on its own for local testing.
+ */
+async function renderVideoAnimationFormat(payload) {
+  const { shots = [], dimensions = "16:9", captionStyle = "Classic", uploadUrl } = payload;
+  const { buffer, width, height } = await renderVideoAnimation({ shots, dimensions, captionStyle });
+
+  if (uploadUrl) {
+    const uploadRes = await fetch(uploadUrl, {
+      method: "POST",
+      headers: { "Content-Type": "video/mp4" },
+      body: buffer,
+    });
+    if (!uploadRes.ok) {
+      throw new Error(`upload to storage failed: ${uploadRes.status} ${await uploadRes.text()}`);
+    }
+    const { storageId } = await uploadRes.json();
+    return { ok: true, width, height, storageId, bytes: buffer.length, contentType: "video/mp4" };
+  }
+
+  return {
+    ok: true,
+    width,
+    height,
+    files: [
+      { name: "output.mp4", contentType: "video/mp4", base64: buffer.toString("base64") },
+    ],
+  };
+}
+
 /** Custom: an upload, framed to a target ratio, with optional text and overlay. */
 async function renderCustomFormat(payload) {
   const {
@@ -349,6 +393,17 @@ const server = createServer(async (req, res) => {
     try {
       const payload = await readBody(req);
       const out = await renderSlideshowFormat(payload);
+      return json(res, 200, out);
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  if (req.method === "POST" && req.url === "/render/video-animation") {
+    try {
+      const payload = await readBody(req);
+      const out = await renderVideoAnimationFormat(payload);
       return json(res, 200, out);
     } catch (err) {
       console.error(String(err?.stack || err));

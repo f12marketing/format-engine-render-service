@@ -198,6 +198,138 @@ export async function renderCustom({
 }
 
 /**
+ * Video Animation's final assembly: N already-generated clips, each with its
+ * own optional dialogue audio and optional caption, concatenated into one
+ * video with continuous audio.
+ *
+ * Every clip gets an audio track whether it has dialogue or not -- a real
+ * track of silence for quiet shots, never a missing one -- because `concat`
+ * with `a=1` needs exactly one audio input per video input; mixing "some
+ * segments have audio, some don't" would need a second, harder-to-verify
+ * code path for no real benefit.
+ */
+export async function renderVideoAnimation({
+  shots, // [{ videoUrl, audioUrl: string|null, durationSec, caption: string|null }]
+  dimensions = "16:9",
+  captionStyle = "Classic",
+  fps = 30,
+}) {
+  if (!shots?.length) throw new Error("at least one shot is required");
+
+  const ffmpeg = resolveFfmpeg();
+  const [w, h] = dimensionsFor(dimensions);
+  const dir = await mkdtemp(join(tmpdir(), "fe-video-"));
+
+  try {
+    const args = ["-y"];
+    const filters = [];
+    const segmentPairs = [];
+    let nextInputIndex = 0;
+
+    for (let i = 0; i < shots.length; i += 1) {
+      const shot = shots[i];
+      const duration = shot.durationSec || 5;
+
+      const vidRes = await fetch(shot.videoUrl);
+      if (!vidRes.ok) throw new Error(`failed to fetch clip ${i}: ${vidRes.status}`);
+      const vidPath = join(dir, `clip_${i}.mp4`);
+      await writeFile(vidPath, Buffer.from(await vidRes.arrayBuffer()));
+      args.push("-i", vidPath);
+      const vIdx = nextInputIndex++;
+
+      // Cover-fit, not letterbox: a generated clip is already meant to fill
+      // the frame at roughly this aspect, so a crop here is a rounding
+      // correction, not a real loss the way it would be on someone's upload.
+      let vLabel = `v${i}`;
+      filters.push(
+        `[${vIdx}:v]scale=${w}:${h}:force_original_aspect_ratio=increase,` +
+          `crop=${w}:${h},setsar=1,fps=${fps}[${vLabel}]`,
+      );
+
+      if (shot.caption && shot.caption.trim()) {
+        const capPng = await renderCaptionOverlay({
+          text: shot.caption,
+          style: captionStyle,
+          width: w,
+          height: h,
+        });
+        const capPath = join(dir, `cap_${i}.png`);
+        await writeFile(capPath, capPng);
+        args.push("-loop", "1", "-i", capPath);
+        const capIdx = nextInputIndex++;
+        // shortest=1 for the same reason as the slideshow renderer: the
+        // caption PNG is looped indefinitely, and without this the overlay
+        // would run until that infinite input ends, i.e. never.
+        filters.push(`[${vLabel}][${capIdx}:v]overlay=0:0:shortest=1[vc${i}]`);
+        vLabel = `vc${i}`;
+      }
+
+      const aLabel = `a${i}`;
+      if (shot.audioUrl) {
+        const audRes = await fetch(shot.audioUrl);
+        if (!audRes.ok) throw new Error(`failed to fetch audio ${i}: ${audRes.status}`);
+        const audPath = join(dir, `audio_${i}.mp3`);
+        await writeFile(audPath, Buffer.from(await audRes.arrayBuffer()));
+        args.push("-i", audPath);
+        const aIdx = nextInputIndex++;
+        // TTS rarely lands exactly on the clip's duration: atrim cuts it down
+        // if it ran long, apad's whole_dur pads with silence if it ran short.
+        // Together they guarantee this segment is exactly `duration` long,
+        // which concat's audio stream requires to stay in sync with its video.
+        filters.push(
+          `[${aIdx}:a]atrim=0:${duration},apad=whole_dur=${duration},` +
+            `asetpts=PTS-STARTPTS[${aLabel}]`,
+        );
+      } else {
+        // A real silent track, not a missing one -- see the function comment.
+        args.push("-f", "lavfi", "-t", String(duration), "-i", "anullsrc=r=48000:cl=stereo");
+        const aIdx = nextInputIndex++;
+        filters.push(`[${aIdx}:a]asetpts=PTS-STARTPTS[${aLabel}]`);
+      }
+
+      segmentPairs.push(`[${vLabel}][${aLabel}]`);
+    }
+
+    filters.push(`${segmentPairs.join("")}concat=n=${shots.length}:v=1:a=1[outv][outa]`);
+
+    const outPath = join(dir, "out.mp4");
+    args.push(
+      "-filter_complex",
+      filters.join(";"),
+      "-map",
+      "[outv]",
+      "-map",
+      "[outa]",
+      "-r",
+      String(fps),
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-profile:v",
+      "high",
+      "-preset",
+      "medium",
+      "-crf",
+      "20",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      "-movflags",
+      "+faststart",
+      outPath,
+    );
+
+    await run(ffmpeg, args);
+    const buf = await readFile(outPath);
+    return { buffer: buf, width: w, height: h };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/**
  * A Ken Burns slideshow: N stills, each held for a fixed duration with a slow
  * centred zoom, an optional caption burned onto each one, concatenated into a
  * single clip.
