@@ -24,6 +24,8 @@ import {
   renderCustom,
   renderSlideshow,
   renderVideoAnimation,
+  renderVideoHookDemo,
+  renderGreenScreenMeme,
   resolveFfmpeg,
   run,
   setCaptionRenderer,
@@ -248,7 +250,55 @@ async function renderSlideshowFormat(payload) {
 async function renderVideoAnimationFormat(payload) {
   const { shots = [], dimensions = "16:9", captionStyle = "Classic", uploadUrl } = payload;
   const { buffer, width, height } = await renderVideoAnimation({ shots, dimensions, captionStyle });
+  return uploadResult(buffer, width, height, uploadUrl);
+}
 
+/**
+ * Video Hook & Demo: a trending clip then a demo video, caption on the hook.
+ * Same direct-to-storage upload as Video Animation's stitch -- a two-segment
+ * video routinely clears Convex's 16MB function-argument limit as base64.
+ */
+async function renderVideoHookDemoFormat(payload) {
+  const {
+    hookUrl,
+    demoUrl,
+    dimensions = "9:16",
+    captionText = "",
+    captionStyle = "Classic",
+    uploadUrl,
+  } = payload;
+  const { buffer, width, height } = await renderVideoHookDemo({
+    hookUrl,
+    demoUrl,
+    dimensions,
+    captionText,
+    captionStyle,
+  });
+  return uploadResult(buffer, width, height, uploadUrl);
+}
+
+/** Green Screen Meme: chroma-key a trending clip over the user's background. */
+async function renderGreenScreenMemeFormat(payload) {
+  const {
+    clipUrl,
+    backgroundUrl,
+    dimensions = "9:16",
+    captionText = "",
+    captionStyle = "Classic",
+    uploadUrl,
+  } = payload;
+  const { buffer, width, height } = await renderGreenScreenMeme({
+    clipUrl,
+    backgroundUrl,
+    dimensions,
+    captionText,
+    captionStyle,
+  });
+  return uploadResult(buffer, width, height, uploadUrl);
+}
+
+/** Shared by every endpoint whose output should go straight to storage. */
+async function uploadResult(buffer, width, height, uploadUrl) {
   if (uploadUrl) {
     const uploadRes = await fetch(uploadUrl, {
       method: "POST",
@@ -261,14 +311,11 @@ async function renderVideoAnimationFormat(payload) {
     const { storageId } = await uploadRes.json();
     return { ok: true, width, height, storageId, bytes: buffer.length, contentType: "video/mp4" };
   }
-
   return {
     ok: true,
     width,
     height,
-    files: [
-      { name: "output.mp4", contentType: "video/mp4", base64: buffer.toString("base64") },
-    ],
+    files: [{ name: "output.mp4", contentType: "video/mp4", base64: buffer.toString("base64") }],
   };
 }
 
@@ -404,6 +451,28 @@ const server = createServer(async (req, res) => {
     try {
       const payload = await readBody(req);
       const out = await renderVideoAnimationFormat(payload);
+      return json(res, 200, out);
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  if (req.method === "POST" && req.url === "/render/video-hook-demo") {
+    try {
+      const payload = await readBody(req);
+      const out = await renderVideoHookDemoFormat(payload);
+      return json(res, 200, out);
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  if (req.method === "POST" && req.url === "/render/green-screen-meme") {
+    try {
+      const payload = await readBody(req);
+      const out = await renderGreenScreenMemeFormat(payload);
       return json(res, 200, out);
     } catch (err) {
       console.error(String(err?.stack || err));
