@@ -198,6 +198,249 @@ export async function renderCustom({
 }
 
 /**
+ * Video Hook & Demo: a trending clip, then a demo video, one after the other,
+ * with an optional caption burned onto the hook segment only -- the demo
+ * segment is the app's own UI, which needs no caption laid over it.
+ *
+ * Both segments are cover-fit (scaled and cropped to fill the frame) rather
+ * than letterboxed. That is a departure from Custom's "never crop someone's
+ * upload" default, made deliberately here: a hook clip and a demo recording
+ * are both full-bleed vertical video by convention, and letterboxing one
+ * next to a filled other would look like a mistake, not a choice.
+ */
+export async function renderVideoHookDemo({
+  hookUrl,
+  demoUrl,
+  dimensions = "9:16",
+  captionText = "",
+  captionStyle = "Classic",
+  fps = 30,
+}) {
+  if (!hookUrl) throw new Error("a hook clip is required");
+  if (!demoUrl) throw new Error("a demo video is required");
+
+  const ffmpeg = resolveFfmpeg();
+  const [w, h] = dimensionsFor(dimensions);
+  const dir = await mkdtemp(join(tmpdir(), "fe-hookdemo-"));
+
+  try {
+    const args = ["-y"];
+    const filters = [];
+    let nextInputIndex = 0;
+
+    async function fetchTo(url, name) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`failed to fetch ${name}: ${res.status}`);
+      const path = join(dir, name);
+      await writeFile(path, Buffer.from(await res.arrayBuffer()));
+      return path;
+    }
+
+    const hookPath = await fetchTo(hookUrl, "hook.mp4");
+    args.push("-i", hookPath);
+    const hookIdx = nextInputIndex++;
+
+    const demoPath = await fetchTo(demoUrl, "demo.mp4");
+    args.push("-i", demoPath);
+    const demoIdx = nextInputIndex++;
+
+    // The two segments, cover-fit to the same frame, each paired with its own
+    // (or a real silent) audio track -- concat with a=1 needs exactly one
+    // audio input per video input, same requirement as renderVideoAnimation.
+    async function buildSegment(inputIdx, sourcePath, label, withCaption) {
+      let vLabel = `v${label}`;
+      filters.push(
+        `[${inputIdx}:v]scale=${w}:${h}:force_original_aspect_ratio=increase,` +
+          `crop=${w}:${h},setsar=1,fps=${fps}[${vLabel}]`,
+      );
+      if (withCaption && captionText.trim()) {
+        const capPng = await renderCaptionOverlay({
+          text: captionText,
+          style: captionStyle,
+          width: w,
+          height: h,
+        });
+        const capPath = join(dir, `cap_${label}.png`);
+        await writeFile(capPath, capPng);
+        args.push("-loop", "1", "-i", capPath);
+        const capIdx = nextInputIndex++;
+        filters.push(`[${vLabel}][${capIdx}:v]overlay=0:0:shortest=1[vc${label}]`);
+        vLabel = `vc${label}`;
+      }
+
+      const probed = await probe(sourcePath);
+      const hasAudioStream = await hasAudio(sourcePath);
+      const aLabel = `a${label}`;
+      if (hasAudioStream) {
+        filters.push(`[${inputIdx}:a]asetpts=PTS-STARTPTS[${aLabel}]`);
+      } else {
+        const duration = Number(probed?.duration) || 5;
+        args.push("-f", "lavfi", "-t", String(duration), "-i", "anullsrc=r=48000:cl=stereo");
+        const aIdx = nextInputIndex++;
+        filters.push(`[${aIdx}:a]asetpts=PTS-STARTPTS[${aLabel}]`);
+      }
+      return [`[${vLabel}]`, `[${aLabel}]`];
+    }
+
+    const hookPair = await buildSegment(hookIdx, hookPath, "hook", true);
+    const demoPair = await buildSegment(demoIdx, demoPath, "demo", false);
+
+    filters.push(
+      `${hookPair[0]}${hookPair[1]}${demoPair[0]}${demoPair[1]}concat=n=2:v=1:a=1[outv][outa]`,
+    );
+
+    const outPath = join(dir, "out.mp4");
+    args.push(
+      "-filter_complex",
+      filters.join(";"),
+      "-map",
+      "[outv]",
+      "-map",
+      "[outa]",
+      "-r",
+      String(fps),
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-profile:v",
+      "high",
+      "-preset",
+      "medium",
+      "-crf",
+      "20",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "128k",
+      "-movflags",
+      "+faststart",
+      outPath,
+    );
+
+    await run(ffmpeg, args);
+    const buf = await readFile(outPath);
+    return { buffer: buf, width: w, height: h };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Green Screen Meme: a trending clip shot on a green screen, chroma-keyed and
+ * composited over the user's own background image, with an optional caption
+ * on top.
+ *
+ * `chromakey` (YUV-space, unlike the coarser RGB `colorkey`) is applied at a
+ * fixed green + tolerance -- there is no color picker in the config yet, so
+ * this assumes a reasonably clean green screen, which is what "trending
+ * green screen meme" clips are in practice.
+ */
+export async function renderGreenScreenMeme({
+  clipUrl,
+  backgroundUrl,
+  dimensions = "9:16",
+  captionText = "",
+  captionStyle = "Classic",
+  chromaColor = "0x00FF00",
+  similarity = 0.12,
+  blend = 0.06,
+  fps = 30,
+}) {
+  if (!clipUrl) throw new Error("a clip is required");
+  if (!backgroundUrl) throw new Error("a background image is required");
+
+  const ffmpeg = resolveFfmpeg();
+  const [w, h] = dimensionsFor(dimensions);
+  const dir = await mkdtemp(join(tmpdir(), "fe-gsmeme-"));
+
+  try {
+    const clipRes = await fetch(clipUrl);
+    if (!clipRes.ok) throw new Error(`failed to fetch clip: ${clipRes.status}`);
+    const clipPath = join(dir, "clip.mp4");
+    await writeFile(clipPath, Buffer.from(await clipRes.arrayBuffer()));
+
+    const bgRes = await fetch(backgroundUrl);
+    if (!bgRes.ok) throw new Error(`failed to fetch background: ${bgRes.status}`);
+    const bgPath = join(dir, `bg.${extFor(bgRes.headers.get("content-type"), "png")}`);
+    await writeFile(bgPath, Buffer.from(await bgRes.arrayBuffer()));
+
+    const probed = await probe(clipPath);
+    const duration = Number(probed?.duration) || 6;
+    const clipHasAudio = await hasAudio(clipPath);
+
+    const args = ["-y"];
+    // Background held for the clip's own duration -- looping a still, same
+    // as every other generated-background path in this file.
+    args.push("-loop", "1", "-t", String(duration), "-i", bgPath);
+    args.push("-i", clipPath);
+    let nextInputIndex = 2;
+
+    const filters = [
+      `[0:v]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1[bg]`,
+      `[1:v]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1,` +
+        `chromakey=${chromaColor}:${similarity}:${blend}[keyed]`,
+      `[bg][keyed]overlay=0:0:shortest=1,fps=${fps}[composited]`,
+    ];
+
+    let last = "[composited]";
+    if (captionText.trim()) {
+      const capPng = await renderCaptionOverlay({
+        text: captionText,
+        style: captionStyle,
+        width: w,
+        height: h,
+      });
+      const capPath = join(dir, "cap.png");
+      await writeFile(capPath, capPng);
+      args.push("-loop", "1", "-i", capPath);
+      const capIdx = nextInputIndex++;
+      filters.push(`${last}[${capIdx}:v]overlay=0:0:shortest=1[capped]`);
+      last = "[capped]";
+    }
+
+    const outPath = join(dir, "out.mp4");
+    args.push(
+      "-filter_complex",
+      filters.join(";"),
+      "-map",
+      last,
+      "-t",
+      String(duration),
+      "-r",
+      String(fps),
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-profile:v",
+      "high",
+      "-preset",
+      "medium",
+      "-crf",
+      "20",
+      "-movflags",
+      "+faststart",
+    );
+
+    // The clip's own sound (music, voice) is the meme's audio; the background
+    // is a still image with nothing to contribute.
+    if (clipHasAudio) {
+      args.push("-map", "1:a", "-c:a", "aac", "-b:a", "128k");
+    } else {
+      args.push("-an");
+    }
+
+    args.push(outPath);
+    await run(ffmpeg, args);
+    const buf = await readFile(outPath);
+    return { buffer: buf, width: w, height: h };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/**
  * Video Animation's final assembly: N already-generated clips, each with its
  * own optional dialogue audio and optional caption, concatenated into one
  * video with continuous audio.
@@ -480,7 +723,7 @@ export async function probe(path) {
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height,duration",
+        "stream=width,height,duration:format=duration",
         "-of",
         "json",
         path,
@@ -493,9 +736,37 @@ export async function probe(path) {
     proc.on("error", () => resolve(null));
     proc.on("close", () => {
       try {
-        resolve(JSON.parse(out).streams?.[0] ?? null);
+        const parsed = JSON.parse(out);
+        const stream = parsed.streams?.[0] ?? {};
+        // Container-level duration (format.duration) is present far more
+        // reliably than the per-stream figure -- fall back to it rather than
+        // trust stream.duration alone, which several mp4 producers omit.
+        const duration = stream.duration ?? parsed.format?.duration ?? null;
+        resolve({ ...stream, duration });
       } catch {
         resolve(null);
+      }
+    });
+  });
+}
+
+/** Whether a media file has an audio stream at all -- ffprobe exits non-zero (via -select_streams a) when there is none, which the promise resolves as false rather than rejecting. */
+export async function hasAudio(path) {
+  const ffprobe = process.env.FFPROBE_BIN || "ffprobe";
+  return new Promise((resolve) => {
+    const proc = spawn(
+      ffprobe,
+      ["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "json", path],
+      { windowsHide: true },
+    );
+    let out = "";
+    proc.stdout.on("data", (d) => (out += d.toString()));
+    proc.on("error", () => resolve(false));
+    proc.on("close", () => {
+      try {
+        resolve((JSON.parse(out).streams ?? []).length > 0);
+      } catch {
+        resolve(false);
       }
     });
   });
