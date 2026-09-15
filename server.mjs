@@ -34,6 +34,7 @@ import {
   run,
   setCaptionRenderer,
 } from "./video.mjs";
+import { packImages } from "./images.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = join(ROOT, "carousel-templates");
@@ -569,6 +570,37 @@ const server = createServer(async (req, res) => {
         ok: true,
         contentType: "audio/mpeg",
         base64: buffer.toString("base64"),
+      });
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  // Influencer training's dataset packer -- 10-50 reference photos, so
+  // always uploadUrl'd rather than returned as base64; unlike the frame/audio
+  // utilities above, this one has no small-payload case worth keeping.
+  if (req.method === "POST" && req.url === "/pack/images") {
+    try {
+      const { imageUrls, uploadUrl } = await readBody(req);
+      const buffer = await packImages(imageUrls);
+      if (!uploadUrl) {
+        return json(res, 400, { ok: false, error: "uploadUrl is required" });
+      }
+      const uploadRes = await fetch(uploadUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/zip" },
+        body: buffer,
+      });
+      if (!uploadRes.ok) {
+        throw new Error(`upload to storage failed: ${uploadRes.status} ${await uploadRes.text()}`);
+      }
+      const { storageId } = await uploadRes.json();
+      return json(res, 200, {
+        ok: true,
+        storageId,
+        bytes: buffer.length,
+        contentType: "application/zip",
       });
     } catch (err) {
       console.error(String(err?.stack || err));
