@@ -9,21 +9,32 @@ render minutes rather than with users.
 
 ```bash
 npm install
-npm start          # http://localhost:4000
+RENDER_SERVICE_API_KEY=<a long random string> npm start   # http://localhost:4000
 ```
 
 Then point the Convex deployment at it:
 
 ```bash
 npx convex env set RENDER_SERVICE_URL http://localhost:4000
+npx convex env set RENDER_SERVICE_API_KEY <the same string>
 ```
 
 ## Requirements
 
 - **Chrome or Edge** — set `CHROME_BIN` if it isn't in a standard location.
 - **ffmpeg** on PATH — set `FFMPEG_BIN` to override.
+- **`RENDER_SERVICE_API_KEY`** — required. This service fetches whatever URL a
+  caller supplies and runs a real browser and ffmpeg against it, and there is
+  no platform-level auth in front of it on Railway, so every route but
+  `/health` rejects requests with a missing or wrong `X-Render-Key` header.
+  Generate a fresh value per environment (`node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`)
+  — local dev and production should not share one — and set the matching
+  Convex env var above so the two sides agree. Leaving it unset makes the
+  service reject everything but `/health`, on purpose: refusing is safer than
+  serving unauthenticated.
 
-`GET /health` reports whether it found both.
+`GET /health` reports whether it found Chrome and ffmpeg, and needs no key —
+Railway's own healthcheck (`railway.json`) calls it with no headers.
 
 ## Endpoints
 

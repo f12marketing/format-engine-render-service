@@ -17,6 +17,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { timingSafeEqual } from "node:crypto";
 import puppeteer from "puppeteer-core";
 import { dimsFor, slideHtml } from "./carousel-templates/slide-dom.js";
 import { captionLayerHtml, dimensionsFor } from "./caption-styles.js";
@@ -39,6 +40,52 @@ import { packImages } from "./images.mjs";
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = join(ROOT, "carousel-templates");
 const PORT = Number(process.env.PORT || 4000);
+
+/**
+ * This service fetches whatever URL a caller supplies (`videoUrl`,
+ * `imageUrls`, etc.) and runs a real browser and ffmpeg against it -- with no
+ * platform-level gate in front of it on Railway, an unauthenticated request
+ * would make it a free SSRF/compute proxy for anyone who finds the URL. Every
+ * route but /health (Railway's own healthcheck hits that with no headers)
+ * requires this key. Fails closed: if it's unset, nothing but /health is
+ * servable, same as the Zernio webhook secret's own "refuse rather than
+ * accept unverifiable" rule in the sibling Convex app.
+ */
+const API_KEY = (process.env.RENDER_SERVICE_API_KEY ?? "").trim();
+if (!API_KEY) {
+  console.warn(
+    "RENDER_SERVICE_API_KEY is not set -- every route but /health will reject all requests.",
+  );
+}
+
+function isAuthorized(req) {
+  if (!API_KEY) return false;
+  const provided = Buffer.from(String(req.headers["x-render-key"] ?? ""));
+  const expected = Buffer.from(API_KEY);
+  return provided.length === expected.length && timingSafeEqual(provided, expected);
+}
+
+/**
+ * On top of the key, not instead of it: a leaked key or a runaway retry loop
+ * on the Convex side shouldn't be able to spin up unlimited headless-Chrome
+ * and ffmpeg jobs on paid Railway compute. One process, one deployment, so a
+ * plain in-memory fixed-window counter is enough -- no need to share state
+ * across instances the way a multi-node service would.
+ */
+const RATE_LIMIT_MAX = 30;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+let rateLimitWindowStart = Date.now();
+let rateLimitCount = 0;
+
+function isRateLimited() {
+  const now = Date.now();
+  if (now - rateLimitWindowStart >= RATE_LIMIT_WINDOW_MS) {
+    rateLimitWindowStart = now;
+    rateLimitCount = 0;
+  }
+  rateLimitCount += 1;
+  return rateLimitCount > RATE_LIMIT_MAX;
+}
 
 /** Drives the Chrome or Edge already installed rather than downloading ~170MB of Chromium. */
 function resolveBrowser() {
@@ -433,6 +480,14 @@ const server = createServer(async (req, res) => {
       })(),
       ffmpeg: ffmpegOk,
     });
+  }
+
+  if (!isAuthorized(req)) {
+    return json(res, 401, { ok: false, error: "unauthorized" });
+  }
+
+  if (isRateLimited()) {
+    return json(res, 429, { ok: false, error: "rate limit exceeded" });
   }
 
   if (req.method === "POST" && req.url === "/render/carousel") {
