@@ -41,9 +41,10 @@ Railway's own healthcheck (`railway.json`) calls it with no headers.
 | | Does |
 | --- | --- |
 | `POST /render/carousel` | A slide deck → one PNG per slide at true size, a PDF, and caption.txt |
-| `POST /render/wall-of-text` | Bold text on a plain (or colored) background → an MP4 |
-| `POST /render/slideshow` | N generated stills with Ken Burns pan/zoom and a caption per slide → an MP4 |
-| `POST /render/video-animation` | N clips, each with optional dialogue audio and a caption, stitched → an MP4 |
+| `POST /render/wall-of-text` | A phone clip (`videoUrl`) cover-fit to 9:16 with a full-frame text layer over it for the whole video, keeping its own sound or replacing it with `audioUrl` → an MP4. The layer is `layerHtml`, a page the format engine builds from the same style module its studio previews with; this service screenshots it transparently and overlays it. Without `layerHtml`, the older bold-text-on-a-plain-background render |
+| `POST /render/slideshow` | N generated stills with Ken Burns zoom and a caption per slide, crossfaded, with optional music underneath — then optionally wrapped in uploaded bookend videos and branded title/end cards → an MP4. Voice is either one `voiceoverUrl` for the whole cut (every slide then holds exactly `secondsPerImage`, and the last is extended only if the voice outruns them) or an optional `narration` line per slide (a slide holds as long as its line takes) |
+| `POST /render/video-animation` | N clips, each with an optional caption and optional dialogue audio, stitched — optionally with one `voiceoverUrl` laid across the whole cut (each clip is then trimmed to exactly its `durationSec`, so the picture keeps the voice's clock) and a looped music bed under the voice, and wrapped in uploaded bookend videos and branded title/end cards → an MP4. Also the join for Kling's chained segments |
+| `POST /render/drama` | N filmed beats that keep their own lip-synced audio, with optional narration per beat, subtitles and a music bed → an MP4 |
 | `POST /render/video-hook-demo` | A trending clip then a demo video, caption on the hook → an MP4 |
 | `POST /render/green-screen-meme` | Chroma-keys a trending clip over the user's own background → an MP4 |
 | `POST /render/picture-in-picture` | An avatar keyed into a corner of a looping demo video → an MP4 |
@@ -53,10 +54,10 @@ Railway's own healthcheck (`railway.json`) calls it with no headers.
 | `POST /extract/audio` | A video URL → just its audio track, as an MP3 |
 | `POST /pack/images` | N image URLs → one zip archive, uploaded to the given URL |
 
-Two response shapes, not one. `/render/carousel`, `/render/slideshow` and the
-single-utility endpoints (`/inspect/video`, `/frame/first`, `/extract/audio`)
+Two response shapes, not one. `/render/carousel` and the single-utility
+endpoints (`/inspect/video`, `/frame/first`, `/frame/last`, `/extract/audio`)
 always return base64 — small enough that the round trip through JSON is
-cheap. `/render/video-animation`, `/render/video-hook-demo`,
+cheap. `/render/slideshow`, `/render/video-animation`, `/render/drama`, `/render/video-hook-demo`,
 `/render/green-screen-meme`, `/render/picture-in-picture`, `/render/custom`
 and `/render/wall-of-text` (which is `/render/custom` under a different
 default) instead take an `uploadUrl` and upload the finished file straight to
@@ -76,10 +77,25 @@ keeps the whole upload; `cover` crops to fill. A 16:9 screen recording is
 unwatchable cropped into 9:16, and a photo is fine — so the tool asks
 rather than guessing.
 
+**Bookends are re-encoded, never stream-copied.** `/render/slideshow`'s
+`startVideoUrl` / `endVideoUrl` and its branded cards are joined through one
+`filter_complex` concat, which forces every segment to a common resolution,
+frame rate and timestamp base. The old app proved why: copy-concatenating an
+arbitrary upload onto generated footage through the concat *demuxer* silently
+corrupts the result — a 1280x650/24fps start frame joined onto 1920x1080/30fps
+content produced a file reporting ~655s for under 100s of real footage, with
+the end frame dropped entirely. Audio is delayed per segment and summed rather
+than concatenated, and a segment with no audio track (a still card, a silent
+upload, a cut with neither voiceover nor score) gets synthesised silence of its
+own length — `[N:a?]` works on `-map` but **not** on a filtergraph input pad,
+where it fails the whole graph with "matches no streams".
+
 ## Known limit
 
 Solved for the endpoints that upload straight to a signed URL instead of
-round-tripping base64 through JSON, but `/render/carousel` and
-`/render/slideshow` still don't take an `uploadUrl` — fine for a deck of
-stills or a short slideshow, wrong for a long one, at which point they
-should take the same `uploadUrl` the video endpoints already do.
+round-tripping base64 through JSON. `/render/carousel` still doesn't take an
+`uploadUrl` — fine for a deck of stills, wrong for a very long one, at which
+point it should take the same `uploadUrl` the video endpoints do.
+`/render/slideshow` used to be in the same position and wasn't fine: a
+12-second cut is ~6 MiB, over Convex's 5 MiB cap on a Node action's
+arguments once base64-encoded, so it now takes an `uploadUrl` too.
