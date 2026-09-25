@@ -20,20 +20,24 @@ import { fileURLToPath } from "node:url";
 import { timingSafeEqual } from "node:crypto";
 import puppeteer from "puppeteer-core";
 import { dimsFor, slideHtml } from "./carousel-templates/slide-dom.js";
-import { captionLayerHtml, dimensionsFor } from "./caption-styles.js";
+import { brandCardHtml, captionLayerHtml, dimensionsFor } from "./caption-styles.js";
 import {
   renderCustom,
   renderSlideshow,
+  wrapWithBookends,
   renderVideoAnimation,
+  renderDrama,
   renderVideoHookDemo,
   renderGreenScreenMeme,
   renderPictureInPicture,
+  renderWallOfText,
   inspectVideo,
-  extractFirstFrame,
+  extractFrame,
   extractAudioTrack,
   resolveFfmpeg,
   run,
   setCaptionRenderer,
+  setCardRenderer,
 } from "./video.mjs";
 import { packImages } from "./images.mjs";
 
@@ -257,11 +261,64 @@ async function renderCaptionLayer({ text, style, width, height, position, scale 
   }
 }
 
-// video.mjs owns ffmpeg only; it cannot launch a browser itself, so the
-// caption renderer -- which needs Chrome -- is handed to it once at startup.
-setCaptionRenderer((opts) => renderCaptionLayer(opts));
+/**
+ * Draws a branded title card or end screen as a full-frame opaque PNG.
+ *
+ * Opaque, unlike a caption layer, because this becomes its own segment on the
+ * timeline rather than an overlay on someone else's frame.
+ *
+ * A logo is inlined as a data URI rather than left as a remote `<img src>`:
+ * Chrome's `load` event does not wait for a slow third-party fetch, and a
+ * card that renders a beat before the logo arrives would ship without it.
+ * Fetching it here means it is either embedded in the HTML before the page
+ * exists, or it is not there at all.
+ */
+async function renderBrandCardImage({ kind, width, height, logoUrl, ...branding }) {
+  let logoDataUri = null;
+  if (logoUrl) {
+    const res = await fetch(logoUrl);
+    if (!res.ok) throw new Error(`failed to fetch the brand logo: ${res.status}`);
+    const type = res.headers.get("content-type") || "image/png";
+    logoDataUri = `data:${type};base64,${Buffer.from(await res.arrayBuffer()).toString("base64")}`;
+  }
 
-/** Slideshow: N generated stills, Ken Burns pan/zoom, a caption per slide. */
+  const browser = await puppeteer.launch({
+    executablePath: resolveBrowser(),
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"],
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width, height, deviceScaleFactor: 1 });
+    await page.setContent(brandCardHtml({ ...branding, kind, width, height, logoDataUri }), {
+      // The card pulls a Google Font over the network, so `load` alone can
+      // fire with the fallback face still on screen.
+      waitUntil: "networkidle0",
+    });
+    await page.evaluateHandle("document.fonts.ready");
+    return Buffer.from(await page.screenshot({ type: "png" }));
+  } finally {
+    await browser.close();
+  }
+}
+
+// video.mjs owns ffmpeg only; it cannot launch a browser itself, so the two
+// renderers that need Chrome are handed to it once at startup.
+setCaptionRenderer((opts) => renderCaptionLayer(opts));
+setCardRenderer((opts) => renderBrandCardImage(opts));
+
+/**
+ * Slideshow: N generated stills, Ken Burns pan/zoom, a caption per slide,
+ * then -- optionally -- uploaded bookend videos and branded cards wrapped
+ * around the result.
+ *
+ * Two ffmpeg passes rather than one graph. The slideshow's own graph is
+ * already N inputs of zoompan and crossfade arithmetic that assumes a
+ * timeline starting at zero; splicing arbitrary uploads into it would mean
+ * every caption's `enable=between(t,…)` window shifting by the start frame's
+ * length. Wrapping afterwards leaves that arithmetic alone, and costs one
+ * extra encode on a step that is free at the margin anyway.
+ */
 async function renderSlideshowFormat(payload) {
   const {
     images = [],
@@ -269,24 +326,47 @@ async function renderSlideshowFormat(payload) {
     dimensions = "9:16",
     secondsPerImage = 3,
     captionStyle = "Classic",
+    narration = [],
+    voiceoverUrl = null,
+    musicUrl = null,
+    musicVolume,
+    transition = "fade",
+    transitionSeconds = 0.5,
+    startVideoUrl = null,
+    endVideoUrl = null,
+    branding = null,
+    uploadUrl,
   } = payload;
 
-  const { buffer, width, height } = await renderSlideshow({
+  const cut = await renderSlideshow({
     images,
     captions,
     dimensions,
     secondsPerImage,
     captionStyle,
+    narration,
+    voiceoverUrl,
+    musicUrl,
+    ...(musicVolume === undefined ? {} : { musicVolume }),
+    transition,
+    transitionSeconds,
   });
 
-  return {
-    ok: true,
-    width,
-    height,
-    files: [
-      { name: "output.mp4", contentType: "video/mp4", base64: buffer.toString("base64") },
-    ],
-  };
+  // A no-op that returns the same buffer when there is nothing to wrap.
+  const { buffer, width, height } = await wrapWithBookends({
+    buffer: cut.buffer,
+    width: cut.width,
+    height: cut.height,
+    startVideoUrl,
+    endVideoUrl,
+    branding,
+  });
+
+  // Uploaded straight to the caller's signed URL when given one: a 12-second
+  // 1080x1920 cut is ~6 MiB, and as base64 it overran Convex's 5 MiB cap on
+  // a Node action's arguments. Without one it still returns base64, so the
+  // route stays curl-able on its own.
+  return uploadResult(buffer, width, height, uploadUrl);
 }
 
 /**
@@ -298,10 +378,71 @@ async function renderSlideshowFormat(payload) {
  * uses, just with this service standing in for a person. `uploadUrl` is
  * required in practice; the base64 fallback exists only so this endpoint
  * stays curl-able on its own for local testing.
+ *
+ * Also the join for Kling's chained segments and every narrated format, none
+ * of which send the trailing fields: `musicUrl`, `startVideoUrl`,
+ * `endVideoUrl` and `branding` are all optional and default to nothing, in
+ * which case this is exactly the stitch it always was. The bookend wrap is a
+ * second pass for the reason renderSlideshowFormat gives -- the stitch's own
+ * graph assumes a timeline that starts at zero.
  */
 async function renderVideoAnimationFormat(payload) {
-  const { shots = [], dimensions = "16:9", captionStyle = "Classic", uploadUrl } = payload;
-  const { buffer, width, height } = await renderVideoAnimation({ shots, dimensions, captionStyle });
+  const {
+    shots = [],
+    dimensions = "16:9",
+    captionStyle = "Classic",
+    extendToAudio = false,
+    voiceoverUrl = null,
+    musicUrl = null,
+    musicVolume,
+    startVideoUrl = null,
+    endVideoUrl = null,
+    branding = null,
+    uploadUrl,
+  } = payload;
+  const cut = await renderVideoAnimation({
+    shots,
+    dimensions,
+    captionStyle,
+    extendToAudio: extendToAudio === true,
+    voiceoverUrl,
+    musicUrl,
+    ...(musicVolume === undefined ? {} : { musicVolume }),
+  });
+  // A no-op that returns the same buffer when there is nothing to wrap.
+  const { buffer, width, height } = await wrapWithBookends({
+    buffer: cut.buffer,
+    width: cut.width,
+    height: cut.height,
+    startVideoUrl,
+    endVideoUrl,
+    branding,
+  });
+  return uploadResult(buffer, width, height, uploadUrl);
+}
+
+/**
+ * Drama: filmed beats that keep their own lip-synced audio, narration laid
+ * over where a beat has it, an optional score underneath. Same
+ * direct-to-storage upload as Video Animation -- an episode is well past
+ * Convex's 16MB argument ceiling as base64.
+ */
+async function renderDramaFormat(payload) {
+  const {
+    beats = [],
+    dimensions = "9:16",
+    captionStyle = "Classic",
+    musicUrl = null,
+    musicVolume,
+    uploadUrl,
+  } = payload;
+  const { buffer, width, height } = await renderDrama({
+    beats,
+    dimensions,
+    captionStyle,
+    musicUrl,
+    musicVolume,
+  });
   return uploadResult(buffer, width, height, uploadUrl);
 }
 
@@ -447,6 +588,53 @@ async function renderCustomFormat(payload) {
   return uploadResult(buffer, width, height, uploadUrl);
 }
 
+/**
+ * Screenshots a full-frame page into a transparent PNG.
+ *
+ * Wall of Text's layer is built by the format engine from the same style
+ * functions its studio previews with, so the page is taken as given rather
+ * than re-described here -- a second copy of that styling in this repo is
+ * exactly the drift the arrangement exists to prevent. It is only reachable
+ * with the render key, like every other route that loads a caller's URLs.
+ * Waits for the web font and every image to be ready: a frame screenshotted
+ * a beat early ships in the fallback face, or without its overlay.
+ */
+async function renderLayerHtml(html, width, height) {
+  const browser = await puppeteer.launch({
+    executablePath: resolveBrowser(),
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"],
+  });
+  try {
+    const page = await browser.newPage();
+    await page.setViewport({ width, height, deviceScaleFactor: 1 });
+    await page.setContent(html, { waitUntil: "networkidle0", timeout: 45_000 });
+    await page.evaluate(async () => {
+      await document.fonts.ready;
+      await Promise.all(
+        [...document.images].map((img) => (img.complete ? null : img.decode().catch(() => null))),
+      );
+    });
+    return Buffer.from(await page.screenshot({ type: "png", omitBackground: true }));
+  } finally {
+    await browser.close();
+  }
+}
+
+async function renderWallOfTextFormat(payload) {
+  const { layerHtml, videoUrl, audioUrl = null, maxDurationSec = 60, uploadUrl } = payload;
+  if (typeof layerHtml !== "string" || !layerHtml) throw new Error("layerHtml is required");
+  const [w, h] = dimensionsFor("9:16");
+  const layerPng = await renderLayerHtml(layerHtml, w, h);
+  const { buffer, width, height, durationSec } = await renderWallOfText({
+    videoUrl,
+    audioUrl,
+    layerPng,
+    maxDurationSec,
+  });
+  return { ...(await uploadResult(buffer, width, height, uploadUrl)), durationSec };
+}
+
 // ---- HTTP -------------------------------------------------------------------
 
 function json(res, status, body) {
@@ -479,6 +667,10 @@ const server = createServer(async (req, res) => {
         try { return resolveBrowser(); } catch { return null; }
       })(),
       ffmpeg: ffmpegOk,
+      // Slideshow and Video Animation send one `voiceoverUrl` for the whole cut.
+      // A service without this field would ignore it and render the video
+      // silently, so the format engine checks for it before it spends anything.
+      voiceover: true,
     });
   }
 
@@ -504,8 +696,12 @@ const server = createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/render/wall-of-text") {
     try {
       const p = await readBody(req);
-      // No upload, a generated ground, and type large enough to be the subject
-      // rather than a caption on one.
+      // The current format: text laid over a phone clip, drawn by the caller.
+      if (p.layerHtml) {
+        return json(res, 200, await renderWallOfTextFormat(p));
+      }
+      // Jobs from before the clip existed: no upload, a generated ground, and
+      // type large enough to be the subject rather than a caption on one.
       const out = await renderCustomFormat({
         ...p,
         source: null,
@@ -535,6 +731,17 @@ const server = createServer(async (req, res) => {
     try {
       const payload = await readBody(req);
       const out = await renderVideoAnimationFormat(payload);
+      return json(res, 200, out);
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  if (req.method === "POST" && req.url === "/render/drama") {
+    try {
+      const payload = await readBody(req);
+      const out = await renderDramaFormat(payload);
       return json(res, 200, out);
     } catch (err) {
       console.error(String(err?.stack || err));
@@ -602,10 +809,10 @@ const server = createServer(async (req, res) => {
     }
   }
 
-  if (req.method === "POST" && req.url === "/frame/first") {
+  if (req.method === "POST" && (req.url === "/frame/first" || req.url === "/frame/last")) {
     try {
       const { videoUrl } = await readBody(req);
-      const buffer = await extractFirstFrame(videoUrl);
+      const buffer = await extractFrame(videoUrl, req.url === "/frame/last" ? "last" : "first");
       return json(res, 200, {
         ok: true,
         contentType: "image/png",

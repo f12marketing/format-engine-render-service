@@ -117,6 +117,100 @@ export function captionLayerHtml({
 </body></html>`;
 }
 
+/**
+ * A branded title card or end screen, as a full-frame opaque page.
+ *
+ * The old app rendered these in Remotion, which meant a second renderer, a
+ * Node toolchain on the render box and a logo placed on disk by hand. They
+ * are the same thing the caption layers already are -- typography Chrome
+ * draws and ffmpeg composites -- so they are drawn here instead. The only
+ * differences from a caption layer: these are opaque, and they become their
+ * own segment on the timeline rather than an overlay on someone else's.
+ *
+ * `kind` is "title" or "end". The title card leads with the brand name; the
+ * end screen leads with the closing message and falls back to the name when
+ * there isn't one, so a blank closing message still produces a real card
+ * rather than an empty one.
+ */
+export function brandCardHtml({
+  kind = "title",
+  width,
+  height,
+  name = "",
+  tagline = "",
+  closingMessage = "",
+  primaryColor = "#111827",
+  accentColor = "#e11d48",
+  textColor = "#ffffff",
+  fontFamily = "Montserrat",
+  logoDataUri = null,
+}) {
+  const isEnd = kind === "end";
+  const headline = isEnd ? closingMessage || name : name;
+  const sub = isEnd ? (closingMessage ? name : tagline) : tagline;
+  // Same base as a caption layer -- width/22 -- so a card is typographically
+  // the same size relative to its frame at every aspect ratio.
+  const base = width / 22;
+  const fontHref =
+    `https://fonts.googleapis.com/css2?family=${encodeURIComponent(fontFamily)}` +
+    ":wght@400;700;900&display=swap";
+
+  return `<!doctype html><html><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="${escapeHtml(fontHref)}" rel="stylesheet">
+<style>
+  html, body { margin: 0; padding: 0; }
+  .card {
+    width: ${width}px; height: ${height}px;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: ${(base * 0.45).toFixed(1)}px;
+    padding: ${Math.round(height * 0.1)}px ${Math.round(width * 0.1)}px;
+    box-sizing: border-box;
+    text-align: center;
+    background: ${primaryColor};
+    font-family: "${fontFamily}", "Segoe UI", system-ui, sans-serif;
+    color: ${textColor};
+    position: relative;
+    overflow: hidden;
+  }
+  /* A wash of the accent behind the type, so the card reads as branded
+     rather than as a flat colour with words on it. */
+  .card::after {
+    content: ""; position: absolute; inset: 0;
+    background: radial-gradient(circle at 50% 18%, ${accentColor}33, transparent 62%);
+  }
+  .card > * { position: relative; z-index: 1; }
+  .logo {
+    max-width: ${Math.round(width * 0.42)}px;
+    max-height: ${Math.round(height * 0.2)}px;
+    object-fit: contain;
+    margin-bottom: ${(base * 0.3).toFixed(1)}px;
+  }
+  .headline {
+    font-size: ${(base * 1.45).toFixed(1)}px; font-weight: 900;
+    line-height: 1.12; text-wrap: balance; margin: 0;
+  }
+  .sub {
+    font-size: ${(base * 0.6).toFixed(1)}px; font-weight: 400;
+    line-height: 1.35; opacity: .82; text-wrap: balance; margin: 0;
+  }
+  .rule {
+    width: ${(base * 2.2).toFixed(1)}px;
+    height: ${Math.max(3, base * 0.1).toFixed(1)}px;
+    background: ${accentColor}; border-radius: 999px;
+  }
+</style></head><body>
+  <div class="card">
+    ${logoDataUri ? `<img class="logo" src="${logoDataUri}" alt="">` : ""}
+    ${headline ? `<h1 class="headline">${escapeHtml(headline)}</h1>` : ""}
+    <div class="rule"></div>
+    ${sub ? `<p class="sub">${escapeHtml(sub)}</p>` : ""}
+  </div>
+</body></html>`;
+}
+
 export function escapeHtml(str) {
   return String(str ?? "").replace(
     /[&<>"]/g,

@@ -600,14 +600,29 @@ export async function renderPictureInPicture({
  * with `a=1` needs exactly one audio input per video input; mixing "some
  * segments have audio, some don't" would need a second, harder-to-verify
  * code path for no real benefit.
+ *
+ * `extendToAudio` is for a single narrated clip (the format engine's
+ * narrated formats): a shot whose narration outlasts its clip is lengthened
+ * to the narration, holding the clip's last frame, instead of the voice
+ * being cut off mid-sentence. Off by default, so Video Animation's per-shot
+ * timing is unchanged.
  */
 export async function renderVideoAnimation({
   shots, // [{ videoUrl, audioUrl: string|null, durationSec, caption: string|null }]
   dimensions = "16:9",
   captionStyle = "Classic",
   fps = 30,
+  extendToAudio = false,
+  // ONE continuous voiceover laid across the whole cut, on top of the concat.
+  // Each clip is trimmed to exactly its durationSec so the picture keeps the
+  // same clock as the voice (clips run a frame or two off what was asked, and
+  // twenty of those is a second of drift).
+  voiceoverUrl = null,
+  musicUrl = null, // a score, looped and ducked under any dialogue
+  musicVolume = 0.14, // under a voice; a cut with no dialogue at all runs it louder
 }) {
   if (!shots?.length) throw new Error("at least one shot is required");
+  const exactLengths = extendToAudio || Boolean(voiceoverUrl);
 
   const ffmpeg = resolveFfmpeg();
   const [w, h] = dimensionsFor(dimensions);
@@ -618,6 +633,10 @@ export async function renderVideoAnimation({
     const filters = [];
     const segmentPairs = [];
     let nextInputIndex = 0;
+    // The finished timeline's length, summed as each segment is built: the
+    // score is trimmed and faded against it, and it cannot be known earlier
+    // because extendToAudio can lengthen a segment past its requested time.
+    let total = 0;
 
     for (let i = 0; i < shots.length; i += 1) {
       const shot = shots[i];
@@ -630,13 +649,36 @@ export async function renderVideoAnimation({
       args.push("-i", vidPath);
       const vIdx = nextInputIndex++;
 
+      // Fetched before the video filter is built, because with
+      // extendToAudio its length decides how long this segment runs.
+      let audPath = null;
+      if (shot.audioUrl) {
+        const audRes = await fetch(shot.audioUrl);
+        if (!audRes.ok) throw new Error(`failed to fetch audio ${i}: ${audRes.status}`);
+        audPath = join(dir, `audio_${i}.mp3`);
+        await writeFile(audPath, Buffer.from(await audRes.arrayBuffer()));
+      }
+      let length = duration;
+      if (extendToAudio && audPath) {
+        const spoken = Number((await probe(audPath))?.duration);
+        if (Number.isFinite(spoken) && spoken > length) length = spoken;
+      }
+      total += length;
+
       // Cover-fit, not letterbox: a generated clip is already meant to fill
       // the frame at roughly this aspect, so a crop here is a rounding
       // correction, not a real loss the way it would be on someone's upload.
+      // With extendToAudio, tpad holds the last frame and trim lands the
+      // segment on exactly `length`, whatever the clip's own length.
       let vLabel = `v${i}`;
       filters.push(
         `[${vIdx}:v]scale=${w}:${h}:force_original_aspect_ratio=increase,` +
-          `crop=${w}:${h},setsar=1,fps=${fps}[${vLabel}]`,
+          `crop=${w}:${h},setsar=1,fps=${fps}` +
+          (exactLengths
+            ? `,tpad=stop_mode=clone:stop_duration=${length},` +
+              `trim=duration=${length},setpts=PTS-STARTPTS`
+            : "") +
+          `[${vLabel}]`,
       );
 
       if (shot.caption && shot.caption.trim()) {
@@ -658,24 +700,22 @@ export async function renderVideoAnimation({
       }
 
       const aLabel = `a${i}`;
-      if (shot.audioUrl) {
-        const audRes = await fetch(shot.audioUrl);
-        if (!audRes.ok) throw new Error(`failed to fetch audio ${i}: ${audRes.status}`);
-        const audPath = join(dir, `audio_${i}.mp3`);
-        await writeFile(audPath, Buffer.from(await audRes.arrayBuffer()));
+      if (audPath) {
         args.push("-i", audPath);
         const aIdx = nextInputIndex++;
         // TTS rarely lands exactly on the clip's duration: atrim cuts it down
         // if it ran long, apad's whole_dur pads with silence if it ran short.
-        // Together they guarantee this segment is exactly `duration` long,
+        // Together they guarantee this segment is exactly `length` long,
         // which concat's audio stream requires to stay in sync with its video.
+        // (With extendToAudio, `length` already covers the whole narration,
+        // so the atrim no longer cuts anything spoken.)
         filters.push(
-          `[${aIdx}:a]atrim=0:${duration},apad=whole_dur=${duration},` +
+          `[${aIdx}:a]atrim=0:${length},apad=whole_dur=${length},` +
             `asetpts=PTS-STARTPTS[${aLabel}]`,
         );
       } else {
         // A real silent track, not a missing one -- see the function comment.
-        args.push("-f", "lavfi", "-t", String(duration), "-i", "anullsrc=r=48000:cl=stereo");
+        args.push("-f", "lavfi", "-t", String(length), "-i", "anullsrc=r=48000:cl=stereo");
         const aIdx = nextInputIndex++;
         filters.push(`[${aIdx}:a]asetpts=PTS-STARTPTS[${aLabel}]`);
       }
@@ -685,6 +725,50 @@ export async function renderVideoAnimation({
 
     filters.push(`${segmentPairs.join("")}concat=n=${shots.length}:v=1:a=1[outv][outa]`);
 
+    // An optional score, mixed under whatever dialogue the cut has. Added
+    // after the concat rather than per segment: one continuous bed that runs
+    // across the joins is what a score is, and a per-shot one would restart
+    // at every cut.
+    let audioMap = "[outa]";
+    let audioLabel = "outa";
+    if (voiceoverUrl) {
+      const voicePath = join(dir, `voiceover${audioExt(voiceoverUrl)}`);
+      await fetchTo(voiceoverUrl, voicePath, "voiceover");
+      args.push("-i", voicePath);
+      const vIdx = nextInputIndex++;
+      // Padded to the cut's length so the mix below, which follows its first
+      // input, runs to the last frame. The per-shot audio underneath is silence.
+      filters.push(
+        `[${vIdx}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,` +
+          `apad=whole_dur=${total.toFixed(3)}[voice]`,
+      );
+      filters.push("[outa][voice]amix=inputs=2:duration=first:normalize=0[voiced]");
+      audioMap = "[voiced]";
+      audioLabel = "voiced";
+    }
+    if (musicUrl) {
+      const musicPath = join(dir, `music${audioExt(musicUrl)}`);
+      await fetchTo(musicUrl, musicPath, "music");
+      // Looped, so a bed that comes back shorter than the cut still runs to
+      // the last frame instead of dropping out. Pushed after every shot's
+      // inputs, so its index is simply the next one.
+      args.push("-stream_loop", "-1", "-i", musicPath);
+      const mIdx = nextInputIndex++;
+      const hasDialogue = shots.some((s) => s.audioUrl) || Boolean(voiceoverUrl);
+      const volume = hasDialogue ? musicVolume : 0.5;
+      filters.push(
+        `[${mIdx}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,` +
+          `atrim=0:${total.toFixed(3)},asetpts=PTS-STARTPTS,volume=${volume},` +
+          `afade=t=in:d=0.8,afade=t=out:st=${Math.max(0, total - 1.5).toFixed(3)}:d=1.5[music]`,
+      );
+      // normalize=0 keeps the dialogue at its own level instead of halving
+      // it; the limiter catches the rare peak where the two sum past 0 dBFS.
+      filters.push(
+        `[${audioLabel}][music]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.97[mixed]`,
+      );
+      audioMap = "[mixed]";
+    }
+
     const outPath = join(dir, "out.mp4");
     args.push(
       "-filter_complex",
@@ -692,7 +776,7 @@ export async function renderVideoAnimation({
       "-map",
       "[outv]",
       "-map",
-      "[outa]",
+      audioMap,
       "-r",
       String(fps),
       "-c:v",
@@ -723,9 +807,185 @@ export async function renderVideoAnimation({
 }
 
 /**
- * A Ken Burns slideshow: N stills, each held for a fixed duration with a slow
- * centred zoom, an optional caption burned onto each one, concatenated into a
- * single clip.
+ * Drama's final cut: N filmed beats concatenated, keeping each clip's OWN
+ * audio. That is the difference from Video Animation's stitch, which swaps a
+ * clip's sound for separately generated dialogue -- here Seedance has already
+ * spoken the line inside the clip, lip-synced, so replacing its audio would
+ * throw the performance away.
+ *
+ * Narration beats get their voice-over laid on top with the clip's own
+ * ambience ducked under it, and an optional music bed runs under the whole
+ * episode, faded out at the end.
+ *
+ * Each segment is cut to its clip's real, probed length rather than the
+ * requested one: Seedance lands within a frame or two of what was asked, and
+ * trusting the probe keeps audio and picture in step across the concat.
+ */
+export async function renderDrama({
+  beats, // [{ videoUrl, voiceoverUrl: string|null, caption: string|null, durationSec }]
+  dimensions = "9:16",
+  captionStyle = "Classic",
+  musicUrl = null,
+  musicVolume = 0.14,
+  fps = 30,
+}) {
+  if (!beats?.length) throw new Error("at least one beat is required");
+
+  const ffmpeg = resolveFfmpeg();
+  const [w, h] = dimensionsFor(dimensions);
+  const dir = await mkdtemp(join(tmpdir(), "fe-drama-"));
+  // Every audio branch is brought to one format before it meets concat or
+  // amix -- Seedance, IndexTTS and ElevenLabs don't agree on sample rate.
+  const toStereo48k = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
+
+  try {
+    const args = ["-y"];
+    const filters = [];
+    const segmentPairs = [];
+    let nextInputIndex = 0;
+    let total = 0;
+
+    for (let i = 0; i < beats.length; i += 1) {
+      const beat = beats[i];
+
+      const vidPath = join(dir, `clip_${i}.mp4`);
+      await fetchTo(beat.videoUrl, vidPath, `clip ${i}`);
+      const [info, withAudio] = await Promise.all([probe(vidPath), hasAudio(vidPath)]);
+      const duration = Number(info?.duration) || beat.durationSec || 5;
+      total += duration;
+
+      args.push("-i", vidPath);
+      const vIdx = nextInputIndex++;
+      let vLabel = `v${i}`;
+      filters.push(
+        `[${vIdx}:v]trim=duration=${duration},setpts=PTS-STARTPTS,` +
+          `scale=${w}:${h}:force_original_aspect_ratio=increase,` +
+          `crop=${w}:${h},setsar=1,fps=${fps}[${vLabel}]`,
+      );
+
+      if (beat.caption && beat.caption.trim()) {
+        const capPng = await renderCaptionOverlay({
+          text: beat.caption,
+          style: captionStyle,
+          width: w,
+          height: h,
+        });
+        const capPath = join(dir, `cap_${i}.png`);
+        await writeFile(capPath, capPng);
+        args.push("-loop", "1", "-i", capPath);
+        const capIdx = nextInputIndex++;
+        filters.push(`[${vLabel}][${capIdx}:v]overlay=0:0:shortest=1[vc${i}]`);
+        vLabel = `vc${i}`;
+      }
+
+      // The clip's own sound, or a real silent track when it has none -- the
+      // same one-audio-per-video rule concat imposes in renderVideoAnimation.
+      let aLabel = `ca${i}`;
+      if (withAudio) {
+        filters.push(
+          `[${vIdx}:a]${toStereo48k},atrim=0:${duration},apad=whole_dur=${duration},` +
+            `asetpts=PTS-STARTPTS[${aLabel}]`,
+        );
+      } else {
+        args.push("-f", "lavfi", "-t", String(duration), "-i", "anullsrc=r=48000:cl=stereo");
+        const sIdx = nextInputIndex++;
+        filters.push(`[${sIdx}:a]${toStereo48k},asetpts=PTS-STARTPTS[${aLabel}]`);
+      }
+
+      if (beat.voiceoverUrl) {
+        const voPath = join(dir, `vo_${i}${audioExt(beat.voiceoverUrl)}`);
+        await fetchTo(beat.voiceoverUrl, voPath, `voice-over ${i}`);
+        args.push("-i", voPath);
+        const oIdx = nextInputIndex++;
+        filters.push(
+          `[${oIdx}:a]${toStereo48k},atrim=0:${duration},apad=whole_dur=${duration},` +
+            `asetpts=PTS-STARTPTS[vo${i}]`,
+        );
+        filters.push(`[${aLabel}]volume=0.35[duck${i}]`);
+        filters.push(`[duck${i}][vo${i}]amix=inputs=2:duration=first:normalize=0[a${i}]`);
+        aLabel = `a${i}`;
+      }
+
+      segmentPairs.push(`[${vLabel}][${aLabel}]`);
+    }
+
+    filters.push(`${segmentPairs.join("")}concat=n=${beats.length}:v=1:a=1[outv][cut]`);
+
+    let outA = "cut";
+    if (musicUrl) {
+      const musicPath = join(dir, `music${audioExt(musicUrl)}`);
+      await fetchTo(musicUrl, musicPath, "music");
+      // Looped, so a score that comes back shorter than the cut still runs
+      // to the last frame instead of dropping out.
+      args.push("-stream_loop", "-1", "-i", musicPath);
+      const mIdx = nextInputIndex++;
+      const fadeStart = Math.max(0, total - 1.5);
+      filters.push(
+        `[${mIdx}:a]${toStereo48k},atrim=0:${total},asetpts=PTS-STARTPTS,` +
+          `volume=${musicVolume},afade=t=out:st=${fadeStart}:d=1.5[music]`,
+      );
+      // normalize=0 keeps the dialogue at its own level instead of halving
+      // it; the limiter catches the rare peak where the two sum past 0 dBFS.
+      filters.push(
+        `[cut][music]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.97[scored]`,
+      );
+      outA = "scored";
+    }
+
+    const outPath = join(dir, "out.mp4");
+    args.push(
+      "-filter_complex",
+      filters.join(";"),
+      "-map",
+      "[outv]",
+      "-map",
+      `[${outA}]`,
+      "-r",
+      String(fps),
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-profile:v",
+      "high",
+      "-preset",
+      "medium",
+      "-crf",
+      "20",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "160k",
+      "-movflags",
+      "+faststart",
+      outPath,
+    );
+
+    await run(ffmpeg, args);
+    const buf = await readFile(outPath);
+    return { buffer: buf, width: w, height: h };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+async function fetchTo(url, path, what) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`failed to fetch ${what}: ${res.status}`);
+  await writeFile(path, Buffer.from(await res.arrayBuffer()));
+}
+
+/** Keep the source's extension so ffmpeg's demuxer probe gets an honest hint. */
+function audioExt(url) {
+  const m = /\.(mp3|wav|m4a|aac|ogg|opus|flac)(?:$|\?)/i.exec(String(url));
+  return m ? `.${m[1].toLowerCase()}` : ".mp3";
+}
+
+/**
+ * A Ken Burns slideshow: N stills, each held with a slow centred zoom and an
+ * optional caption burned onto it, crossfaded into one clip. Optionally a
+ * voice line per slide -- a slide stays up as long as its line needs, never
+ * less than `secondsPerImage` -- and a score looped underneath.
  *
  * Built as one filter_complex graph rather than N renders + a concat pass --
  * fewer intermediate files, and one encode instead of N+1.
@@ -735,36 +995,116 @@ export function setCaptionRenderer(fn) {
   renderCaptionOverlay = fn;
 }
 
+/**
+ * Branded title/end cards, like the caption layers, need Chrome -- which this
+ * module cannot launch. server.mjs hands the renderer in at startup, same as
+ * it does for captions.
+ */
+let renderBrandCard = null;
+export function setCardRenderer(fn) {
+  renderBrandCard = fn;
+}
+
 export async function renderSlideshow({
   images, // [{ url } | { base64, contentType }]
   captions = [], // same length as images, "" for no caption on that slide
   dimensions = "9:16",
-  secondsPerImage = 3,
+  secondsPerImage = 3, // the FLOOR for how long a slide stays up; a longer voice line stretches it
   captionStyle = "Classic",
   fps = 30,
+  narration = [], // same length as images: an audio URL, or a falsy value for no voice on that slide
+  // ONE continuous voiceover the whole cut is built around. When given, every
+  // slide holds for exactly secondsPerImage (the slide count was fitted to the
+  // voice, not the other way round) and `narration` is ignored.
+  voiceoverUrl = null,
+  musicUrl = null, // a score, looped and ducked under the voice
+  transition = "fade", // an ffmpeg xfade transition name, or "none" for hard cuts
+  transitionSeconds = 0.5,
+  musicVolume = 0.14, // under a voice, matching the drama cut; a music-only cut runs louder
 }) {
   if (!images?.length) throw new Error("at least one image is required");
 
   const ffmpeg = resolveFfmpeg();
   const [w, h] = dimensionsFor(dimensions);
   const dir = await mkdtemp(join(tmpdir(), "fe-slideshow-"));
-  const frames = Math.round(secondsPerImage * fps);
+  const n = images.length;
+  // Every audio branch is brought to one format before it meets amix --
+  // ElevenLabs speech and a music model don't agree on sample rate.
+  const toStereo48k = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo";
+  const d = transition === "none" || n < 2 ? 0 : transitionSeconds;
 
   try {
+    // Narration first. How long a slide stays up is decided by how long its
+    // line takes to say, so each clip is fetched and measured before any
+    // video is built -- a fixed 3 seconds would cut a 5-second sentence off.
+    let voiceoverPath = null;
+    let voiceoverSecs = 0;
+    if (voiceoverUrl) {
+      voiceoverPath = join(dir, `voiceover${audioExt(voiceoverUrl)}`);
+      await fetchTo(voiceoverUrl, voiceoverPath, "voiceover");
+      voiceoverSecs = Number((await probe(voiceoverPath))?.duration);
+      if (!Number.isFinite(voiceoverSecs) || voiceoverSecs <= 0) {
+        throw new Error("could not read the length of the voiceover");
+      }
+    }
+
+    const voicePaths = [];
+    const voiceSecs = [];
+    const perSlide = voiceoverPath ? [] : narration;
+    for (let i = 0; i < n; i += 1) {
+      const url = perSlide[i];
+      if (!url) {
+        voicePaths.push(null);
+        voiceSecs.push(0);
+        continue;
+      }
+      const p = join(dir, `voice_${i}${audioExt(url)}`);
+      await fetchTo(url, p, `narration for slide ${i}`);
+      const info = await probe(p);
+      const secs = Number(info?.duration);
+      if (!Number.isFinite(secs) || secs <= 0) {
+        throw new Error(`could not read the length of the narration for slide ${i}`);
+      }
+      voicePaths.push(p);
+      voiceSecs.push(secs);
+    }
+
+    // The voice starts once the slide has finished fading in (or 0.3s into the
+    // first one, which has no fade) and ends a beat before the next cut.
+    const VOICE_TAIL = 0.35;
+    const lead = (i) => (i === 0 ? 0.3 : d);
+    // hold[i] is how much of the FINISHED timeline slide i owns; start[i] where
+    // it begins. Their sum is the video's length. The crossfade INTO slide i
+    // runs over [start[i], start[i] + d].
+    const hold = images.map((_, i) => {
+      const spoken = voiceSecs[i] ? lead(i) + voiceSecs[i] + VOICE_TAIL : 0;
+      return Math.round(Math.max(secondsPerImage, spoken) * 1000) / 1000;
+    });
+    // A single voiceover can outrun the slides by a hair when its length is a
+    // near-exact multiple of the slide time: hold the last slide so it is never cut.
+    if (voiceoverPath) {
+      const shortBy = voiceoverSecs - hold.reduce((sum, h) => sum + h, 0);
+      if (shortBy > 0) hold[hold.length - 1] = Math.round((hold[hold.length - 1] + shortBy) * 1000) / 1000;
+    }
+    const start = [];
+    let total = 0;
+    for (const s of hold) {
+      start.push(total);
+      total += s;
+    }
+
     const args = ["-y"];
     const filters = [];
     const segmentLabels = [];
-    // Tracks the real ffmpeg input index as args are built. A slide and its
-    // caption are pushed back-to-back (image, then caption, then the next
-    // image...), not as two separate blocks -- an earlier version computed
-    // the caption's index as `images.length + i`, which assumes a block
-    // layout that this loop has never actually produced. That mismatch
-    // pulled the WRONG slide's caption onto every segment; only slide 0
-    // happened to render correctly, because at i=0 no prior inputs existed
-    // to be off by.
+    // Tracks the real ffmpeg input index as args are built. Images are pushed
+    // first, then (below) one caption per captioned slide, then the audio.
+    // An earlier version pushed a slide and its caption back-to-back and got
+    // the index arithmetic wrong, pulling the WRONG slide's caption onto every
+    // segment; keeping one counter that every push goes through is what
+    // prevents that.
     let nextInputIndex = 0;
 
-    for (let i = 0; i < images.length; i += 1) {
+    for (let i = 0; i < n; i += 1) {
       const img = images[i];
       const ext = img.contentType ? extFor(img.contentType, "png") : "png";
       const imgPath = join(dir, `slide_${i}.${ext}`);
@@ -777,6 +1117,13 @@ export async function renderSlideshow({
       } else {
         throw new Error(`slide ${i} has neither url nor base64`);
       }
+
+      // A slide is rendered `d` seconds longer than it owns (except the last),
+      // because the next one crossfades in over its tail.
+      const segSeconds = hold[i] + (i < n - 1 ? d : 0);
+      // ...and, when crossfading, one frame longer again: see the fps note below.
+      const trimSeconds = segSeconds + (d > 0 ? 1 / fps : 0);
+      const frames = Math.ceil(trimSeconds * fps);
 
       // No -t on the input. zoompan restarts its full d-frame zoom cycle for
       // EVERY input frame it receives, not once overall -- so `-loop 1 -t N`
@@ -792,49 +1139,143 @@ export async function renderSlideshow({
       // WxH runs out of resolution to zoom into and the shot judders.
       // Centred zoom-in only: safe regardless of subject placement, unlike a
       // pan, which can drift a generated image's subject off-frame.
+      //
+      // No caption here: one burned in now would crossfade WITH its slide,
+      // leaving two captions blended into mush for half a second at every
+      // cut. Captions go on after the join instead.
+      //
+      // xfade, unlike concat, needs every input to have a known constant frame
+      // rate, and zoompan's own fps= option does not give the link one -- an
+      // explicit fps filter does. That filter drops the LAST frame of each
+      // segment (measured: 89 frames out of a 3s/30fps segment, with or
+      // without eof_action=pass), which is why each segment was rendered one
+      // frame long above. Hard cuts go through concat, which needs none of
+      // this and keeps its exact frame count.
       filters.push(
         `[${imgInputIndex}:v]scale=${w * 2}:${h * 2}:force_original_aspect_ratio=increase,` +
           `crop=${w * 2}:${h * 2},` +
           `zoompan=z='min(zoom+0.0012,1.3)':d=${frames}:` +
           `x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=${w}x${h}:fps=${fps},` +
-          `setsar=1,trim=duration=${secondsPerImage},setpts=PTS-STARTPTS[img${i}]`,
+          `setsar=1,trim=duration=${trimSeconds.toFixed(3)},setpts=PTS-STARTPTS,` +
+          (d > 0 ? `fps=${fps},` : "") +
+          `format=yuv420p[seg${i}]`,
       );
-
-      let label = `img${i}`;
-      const caption = captions[i];
-      if (caption && caption.trim()) {
-        const capPng = await renderCaptionOverlay({
-          text: caption,
-          style: captionStyle,
-          width: w,
-          height: h,
-        });
-        const capPath = join(dir, `cap_${i}.png`);
-        await writeFile(capPath, capPng);
-        args.push("-loop", "1", "-i", capPath);
-        const capInputIndex = nextInputIndex++;
-        // `overlay` defaults to running for as long as its LONGER input lasts
-        // (shortest=0), duplicating the shorter stream's last frame to keep
-        // pace -- so pairing a 2-second trimmed clip with an infinitely
-        // looped caption PNG produced a multi-minute output, not a 2-second
-        // one. `shortest=1` makes it stop when [label] (already trimmed)
-        // ends, which is what "one caption per slide" actually means.
-        filters.push(
-          `[${label}][${capInputIndex}:v]overlay=0:0:shortest=1[capped${i}]`,
-        );
-        label = `capped${i}`;
-      }
-      segmentLabels.push(`[${label}]`);
+      segmentLabels.push(`[seg${i}]`);
     }
 
-    filters.push(`${segmentLabels.join("")}concat=n=${images.length}:v=1:a=0[outv]`);
+    if (d > 0) {
+      // Each join starts `d` seconds before the outgoing slide's hold ends, so
+      // the timeline still adds up to exactly `total`.
+      let current = segmentLabels[0];
+      let offset = 0;
+      for (let i = 1; i < n; i += 1) {
+        offset += hold[i - 1];
+        const out = i === n - 1 ? "joined" : `xf${i}`;
+        filters.push(
+          `${current}${segmentLabels[i]}xfade=transition=${transition}:` +
+            `duration=${d}:offset=${offset.toFixed(3)}[${out}]`,
+        );
+        current = `[${out}]`;
+      }
+    } else {
+      filters.push(`${segmentLabels.join("")}concat=n=${n}:v=1:a=0[joined]`);
+    }
+
+    // Captions, onto the finished timeline. Slide i's is up while that slide is
+    // fully on screen: from the end of the fade into it to the start of the
+    // fade out of it, so at a cut there is a beat with none rather than two.
+    let videoLabel = "joined";
+    for (let i = 0; i < n; i += 1) {
+      const caption = captions[i];
+      if (!caption || !caption.trim()) continue;
+      const capPng = await renderCaptionOverlay({
+        text: caption,
+        style: captionStyle,
+        width: w,
+        height: h,
+      });
+      const capPath = join(dir, `cap_${i}.png`);
+      await writeFile(capPath, capPng);
+      args.push("-loop", "1", "-i", capPath);
+      const capInputIndex = nextInputIndex++;
+      const from = i === 0 ? 0 : start[i] + d;
+      const to = i === n - 1 ? total : start[i + 1];
+      // `overlay` defaults to running for as long as its LONGER input lasts
+      // (shortest=0), duplicating the shorter stream's last frame to keep
+      // pace -- so pairing the finished video with an infinitely looped
+      // caption PNG would produce an endless output. `shortest=1` ends it
+      // with the video, which is what "one caption per slide" means.
+      const out = `cap${i}`;
+      filters.push(
+        `[${videoLabel}][${capInputIndex}:v]overlay=0:0:shortest=1:` +
+          `enable='between(t,${from.toFixed(3)},${to.toFixed(3)})'[${out}]`,
+      );
+      videoLabel = out;
+    }
+    filters.push(`[${videoLabel}]format=yuv420p[outv]`);
+
+    // ---- audio -----------------------------------------------------------
+    const voiceLabels = [];
+    if (voiceoverPath) {
+      // Starts with the first slide, not a beat into it: window i of the script
+      // was cut for slide i, so the voice and the picture share a clock.
+      args.push("-i", voiceoverPath);
+      const idx = nextInputIndex++;
+      filters.push(`[${idx}:a]${toStereo48k}[vo0]`);
+      voiceLabels.push("[vo0]");
+    }
+    voicePaths.forEach((p, i) => {
+      if (!p) return;
+      args.push("-i", p);
+      const idx = nextInputIndex++;
+      const ms = Math.round((start[i] + lead(i)) * 1000);
+      filters.push(`[${idx}:a]${toStereo48k},adelay=${ms}|${ms}[vo${i}]`);
+      voiceLabels.push(`[vo${i}]`);
+    });
+    let voiceOut = null;
+    if (voiceLabels.length) {
+      // Padded to the video's length so the mix below, which follows its first
+      // input, runs to the last frame.
+      filters.push(
+        `${voiceLabels.join("")}amix=inputs=${voiceLabels.length}:duration=longest:normalize=0,` +
+          `apad=whole_dur=${total.toFixed(3)}[voice]`,
+      );
+      voiceOut = "voice";
+    }
+
+    let musicOut = null;
+    if (musicUrl) {
+      const musicPath = join(dir, `music${audioExt(musicUrl)}`);
+      await fetchTo(musicUrl, musicPath, "music");
+      // Looped, so a score that comes back shorter than the video still runs
+      // to the last frame instead of dropping out.
+      args.push("-stream_loop", "-1", "-i", musicPath);
+      const mIdx = nextInputIndex++;
+      const volume = voiceOut ? musicVolume : 0.5;
+      filters.push(
+        `[${mIdx}:a]${toStereo48k},atrim=0:${total.toFixed(3)},asetpts=PTS-STARTPTS,` +
+          `volume=${volume},afade=t=in:d=0.8,` +
+          `afade=t=out:st=${Math.max(0, total - 1.5).toFixed(3)}:d=1.5[music]`,
+      );
+      musicOut = "music";
+    }
+
+    let audioOut = voiceOut ?? musicOut;
+    if (voiceOut && musicOut) {
+      // normalize=0 keeps the voice at its own level instead of halving it;
+      // the limiter catches the rare peak where the two sum past 0 dBFS.
+      filters.push(
+        "[voice][music]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.97[mixed]",
+      );
+      audioOut = "mixed";
+    }
 
     const outPath = join(dir, "out.mp4");
+    args.push("-filter_complex", filters.join(";"), "-map", "[outv]");
+    if (audioOut) {
+      args.push("-map", `[${audioOut}]`, "-c:a", "aac", "-b:a", "160k", "-ar", "48000");
+    }
     args.push(
-      "-filter_complex",
-      filters.join(";"),
-      "-map",
-      "[outv]",
       "-r",
       String(fps),
       "-c:v",
@@ -849,13 +1290,235 @@ export async function renderSlideshow({
       "20",
       "-movflags",
       "+faststart",
-      "-an",
+    );
+    if (!audioOut) args.push("-an");
+    args.push("-t", total.toFixed(3), outPath);
+
+    await run(ffmpeg, args);
+    const buf = await readFile(outPath);
+    return { buffer: buf, width: w, height: h, durationSec: total };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/** How long a branded card stays up. The old app's Remotion cards' timings. */
+const TITLE_CARD_SECONDS = 3;
+const END_CARD_SECONDS = 5;
+
+/**
+ * Whether a file carries an audio stream at all.
+ *
+ * `probe` above answers only about video (`-select_streams v:0`), and the
+ * difference matters: a filtergraph pad aimed at an input with no audio
+ * fails the entire render rather than being skipped. Treated as "no" when
+ * ffprobe can't be run, which is the safe direction -- silence is
+ * synthesised and the render still completes.
+ */
+async function hasAudioStream(path) {
+  const ffprobe = process.env.FFPROBE_BIN || "ffprobe";
+  return new Promise((resolve) => {
+    const proc = spawn(
+      ffprobe,
+      ["-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "json", path],
+      { windowsHide: true },
+    );
+    let out = "";
+    proc.stdout.on("data", (d) => (out += d.toString()));
+    proc.on("error", () => resolve(false));
+    proc.on("close", () => {
+      try {
+        resolve((JSON.parse(out).streams ?? []).length > 0);
+      } catch {
+        resolve(false);
+      }
+    });
+  });
+}
+
+/**
+ * Wraps a finished cut in uploaded bookend videos and branded cards:
+ *
+ *     [start frame] [title card] << the cut >> [end card] [end frame]
+ *
+ * Every segment is RE-ENCODED through one filter_complex concat rather than
+ * stream-copied through the concat demuxer. That is not caution, it is a
+ * measured failure: bookend frames are arbitrary user uploads with no
+ * guaranteed resolution, frame rate or container time_base, and the old app
+ * found that copy-concatenating mismatched inputs silently corrupts the
+ * result -- a 1280x650/24fps start frame joined onto 1920x1080/30fps content
+ * produced a file reporting ~655s for under 100s of real footage, with the
+ * end frame dropped entirely (worker/pipeline.py, _concat_bookend_frames).
+ * Routing every segment through one graph forces a common resolution, frame
+ * rate and timestamp base, so both duration and playback come out right.
+ *
+ * Audio is delayed per segment and summed rather than concatenated: each
+ * segment's own audio is offset to its absolute start and mixed, so segments
+ * without any (a silent card, a muted upload) leave a real gap instead of
+ * needing a filter to infer where one ends. `apad` gives every segment the
+ * full-length silent bed that makes that arithmetic hold.
+ *
+ * Returns the original buffer untouched when there is nothing to wrap, so
+ * the caller never pays for a re-encode it didn't ask for.
+ */
+export async function wrapWithBookends({
+  buffer, // the finished cut
+  width,
+  height,
+  fps = 30,
+  startVideoUrl = null,
+  endVideoUrl = null,
+  branding = null, // { name, tagline, closingMessage, colours, fontFamily, logoUrl }
+}) {
+  const wantsCards = Boolean(branding && (branding.name || branding.closingMessage));
+  if (!startVideoUrl && !endVideoUrl && !wantsCards) {
+    return { buffer, width, height };
+  }
+
+  const ffmpeg = resolveFfmpeg();
+  const dir = await mkdtemp(join(tmpdir(), "fe-bookend-"));
+
+  try {
+    const contentPath = join(dir, "content.mp4");
+    await writeFile(contentPath, buffer);
+
+    /**
+     * The timeline, in order. `seconds` is known up front for a card (it is a
+     * still we hold) and probed for an upload -- the concat filter needs a
+     * duration per segment to place the next one's audio.
+     */
+    const segments = [];
+
+    const addUpload = async (url, name) => {
+      const path = join(dir, `${name}.mp4`);
+      await fetchTo(url, path, `${name} frame`);
+      const info = await probe(path);
+      const seconds = Number(info?.duration);
+      if (!Number.isFinite(seconds) || seconds <= 0) {
+        throw new Error(
+          `could not read the length of the ${name} frame -- is it a valid video file?`,
+        );
+      }
+      segments.push({ path, seconds, still: false, hasAudio: await hasAudioStream(path) });
+    };
+
+    const addCard = async (kind, seconds) => {
+      if (!renderBrandCard) throw new Error("no brand-card renderer was registered");
+      const png = await renderBrandCard({ ...branding, kind, width, height });
+      const path = join(dir, `card_${kind}.png`);
+      await writeFile(path, png);
+      segments.push({ path, seconds, still: true });
+    };
+
+    if (startVideoUrl) await addUpload(startVideoUrl, "start");
+    if (wantsCards) await addCard("title", TITLE_CARD_SECONDS);
+
+    const contentInfo = await probe(contentPath);
+    segments.push({
+      path: contentPath,
+      seconds: Number(contentInfo?.duration) || 0,
+      still: false,
+      content: true,
+      // A cut with no voiceover and no score has no audio stream at all.
+      hasAudio: await hasAudioStream(contentPath),
+    });
+
+    if (wantsCards) await addCard("end", END_CARD_SECONDS);
+    if (endVideoUrl) await addUpload(endVideoUrl, "end");
+
+    const args = ["-y"];
+    const filters = [];
+    const videoPads = [];
+    const audioPads = [];
+    let offset = 0;
+
+    segments.forEach((seg, i) => {
+      if (seg.still) {
+        // A still has no duration of its own; -loop plus -t gives it one.
+        args.push("-loop", "1", "-t", String(seg.seconds), "-i", seg.path);
+      } else {
+        args.push("-i", seg.path);
+      }
+
+      // Scale to fit and pad rather than crop: a bookend frame the client
+      // shot at another ratio should letterbox onto the slideshow's frame,
+      // not lose its edges. setsar=1 keeps a source with a non-square pixel
+      // aspect from skewing once it is on a common timeline.
+      filters.push(
+        `[${i}:v]scale=${width}:${height}:force_original_aspect_ratio=decrease,` +
+          `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,` +
+          `fps=${fps},format=yuv420p,setpts=PTS-STARTPTS[bv${i}]`,
+      );
+      videoPads.push(`[bv${i}]`);
+
+      // A still card has no audio track at all; nor does a silent upload, or
+      // a cut rendered with neither voiceover nor score. Each of those gets a
+      // silence of exactly its own length instead, so the delays below still
+      // add up to the right offsets.
+      //
+      // Silence rather than `[i:a?]`: the optional-stream suffix works on
+      // `-map`, but NOT on a filtergraph input pad. Pointing one at an input
+      // with no audio doesn't skip the pad, it fails the whole graph with
+      // "matches no streams" -- measured, on a cut with no audio at all.
+      const ms = Math.round(offset * 1000);
+      const secs = seg.seconds.toFixed(3);
+      if (seg.still || !seg.hasAudio) {
+        filters.push(
+          `anullsrc=channel_layout=stereo:sample_rate=48000,` +
+            `atrim=0:${secs},asetpts=PTS-STARTPTS,adelay=${ms}|${ms}[ba${i}]`,
+        );
+      } else {
+        filters.push(
+          `[${i}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,` +
+            `apad=whole_dur=${secs},atrim=0:${secs},` +
+            `asetpts=PTS-STARTPTS,adelay=${ms}|${ms}[ba${i}]`,
+        );
+      }
+      audioPads.push(`[ba${i}]`);
+      offset += seg.seconds;
+    });
+
+    filters.push(`${videoPads.join("")}concat=n=${segments.length}:v=1:a=0[outv]`);
+    filters.push(
+      `${audioPads.join("")}amix=inputs=${segments.length}:duration=longest:normalize=0,` +
+        `alimiter=limit=0.97[outa]`,
+    );
+
+    const outPath = join(dir, "wrapped.mp4");
+    args.push(
+      "-filter_complex",
+      filters.join(";"),
+      "-map",
+      "[outv]",
+      "-map",
+      "[outa]",
+      "-r",
+      String(fps),
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-profile:v",
+      "high",
+      "-preset",
+      "medium",
+      "-crf",
+      "20",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "160k",
+      "-ar",
+      "48000",
+      "-movflags",
+      "+faststart",
+      "-t",
+      offset.toFixed(3),
       outPath,
     );
 
     await run(ffmpeg, args);
-    const buf = await readFile(outPath);
-    return { buffer: buf, width: w, height: h };
+    return { buffer: await readFile(outPath), width, height };
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -952,8 +1615,16 @@ export async function inspectVideo(videoUrl) {
   }
 }
 
-/** The first frame of a video, as a PNG -- Recreate mode composites a character into it, and verification reads one off the swap output to compare against the reference image. */
-export async function extractFirstFrame(videoUrl) {
+/**
+ * One frame of a video, as a PNG.
+ *
+ * `position` is "first" -- Recreate mode composites a character into it, and
+ * verification reads one off the swap output to compare against the reference
+ * image -- or "last", which is how a clip longer than a video model's own
+ * per-generation ceiling is chained: the tail of one segment is the opening
+ * frame of the next, so the motion carries across the join.
+ */
+export async function extractFrame(videoUrl, position = "first") {
   const ffmpeg = resolveFfmpeg();
   const dir = await mkdtemp(join(tmpdir(), "fe-frame-"));
   try {
@@ -963,11 +1634,23 @@ export async function extractFirstFrame(videoUrl) {
     await writeFile(srcPath, Buffer.from(await res.arrayBuffer()));
 
     const outPath = join(dir, "frame.png");
-    await run(ffmpeg, ["-y", "-i", srcPath, "-vframes", "1", outPath]);
+    // `-sseof -1` seeks a second from the end, then the LAST decoded frame of
+    // what remains is written: seeking to the exact final timestamp lands
+    // past the last keyframe often enough to come back empty.
+    const args =
+      position === "last"
+        ? ["-y", "-sseof", "-1", "-i", srcPath, "-update", "1", "-q:v", "2", outPath]
+        : ["-y", "-i", srcPath, "-vframes", "1", outPath];
+    await run(ffmpeg, args);
     return readFile(outPath);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+/** Back-compat alias: the first frame, by its original name. */
+export async function extractFirstFrame(videoUrl) {
+  return extractFrame(videoUrl, "first");
 }
 
 /** Just the audio track, as an mp3 -- ElevenLabs' voice changer takes a plain audio file, not a video container. */
@@ -983,6 +1666,89 @@ export async function extractAudioTrack(videoUrl) {
     const outPath = join(dir, "audio.mp3");
     await run(ffmpeg, ["-y", "-i", srcPath, "-vn", "-acodec", "libmp3lame", outPath]);
     return readFile(outPath);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Wall of Text: a phone clip with one full-frame text layer over it, start to
+ * finish -- no timing, no animation, which is exactly how the posts it copies
+ * look.
+ *
+ * The layer arrives already drawn (a transparent 1080x1920 PNG the caller
+ * screenshots from the studio's own markup), so this is only the surgery:
+ * cover-fit the clip to 9:16, lay the layer on top, and either keep the
+ * clip's own sound or replace it with the chosen track. A replacement track
+ * is padded with silence and cut at the video's length, so a short sound
+ * never shortens the video and a long one never lengthens it.
+ */
+export async function renderWallOfText({
+  videoUrl,
+  audioUrl = null,
+  layerPng,
+  maxDurationSec = 60,
+  fps = 30,
+}) {
+  if (!videoUrl) throw new Error("videoUrl is required");
+  const ffmpeg = resolveFfmpeg();
+  const [w, h] = dimensionsFor("9:16");
+  const dir = await mkdtemp(join(tmpdir(), "fe-wall-"));
+
+  try {
+    const videoPath = join(dir, "source.mp4");
+    await fetchTo(videoUrl, videoPath, "the video");
+    const layerPath = join(dir, "layer.png");
+    await writeFile(layerPath, layerPng);
+
+    const info = await probe(videoPath);
+    const duration = Math.min(Number(info?.duration) || maxDurationSec, maxDurationSec);
+
+    const args = ["-y", "-i", videoPath, "-i", layerPath];
+    const filters = [
+      `[0:v]scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h},setsar=1,fps=${fps}[base]`,
+      // A single still input holds its one frame for the whole clip.
+      `[base][1:v]overlay=0:0[v]`,
+    ];
+    let audioMap = ["-map", "0:a?"];
+    if (audioUrl) {
+      const audioPath = join(dir, `audio${audioExt(audioUrl)}`);
+      await fetchTo(audioUrl, audioPath, "the audio");
+      args.push("-i", audioPath);
+      filters.push("[2:a]apad[a]");
+      audioMap = ["-map", "[a]"];
+    }
+
+    const outPath = join(dir, "out.mp4");
+    args.push(
+      "-filter_complex",
+      filters.join(";"),
+      "-map",
+      "[v]",
+      ...audioMap,
+      "-t",
+      duration.toFixed(3),
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-profile:v",
+      "high",
+      "-preset",
+      "medium",
+      "-crf",
+      "20",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "160k",
+      "-movflags",
+      "+faststart",
+      outPath,
+    );
+    await run(ffmpeg, args);
+
+    return { buffer: await readFile(outPath), width: w, height: h, durationSec: duration };
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
