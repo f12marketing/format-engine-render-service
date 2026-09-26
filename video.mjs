@@ -221,22 +221,36 @@ export async function renderCustom({
 }
 
 /**
- * Video Hook & Demo: a trending clip, then a demo video, one after the other,
- * with an optional caption burned onto the hook segment only -- the demo
- * segment is the app's own UI, which needs no caption laid over it.
+ * Video Hook & Demo: a few seconds of a trending clip, then a hard cut to the
+ * demo video -- the shape of the "trending content hook + demo" ads this
+ * format copies, where the hook runs 2-6s (most often ~4s) and the demo
+ * carries the rest.
  *
- * Both segments are cover-fit (scaled and cropped to fill the frame) rather
- * than letterboxed. That is a departure from Custom's "never crop someone's
- * upload" default, made deliberately here: a hook clip and a demo recording
- * are both full-bleed vertical video by convention, and letterboxing one
- * next to a filled other would look like a mistake, not a choice.
+ * The hook is cover-fit: it is a face-to-camera clip, and filling the frame is
+ * the whole look. The demo is cover-fit only when its shape is already close
+ * to the frame's (a phone recording into 9:16 loses a sliver, not the UI);
+ * anything further off -- a 16:9 screen recording, say -- is letterboxed on
+ * black instead, which is exactly what the reference ads do. Cropping a
+ * landscape demo to vertical would throw away most of the product.
+ *
+ * The caption sits mid-frame, TikTok-style, over the hook only by default;
+ * `captionOver: "all"` keeps it up through the demo too, which about half the
+ * references do.
  */
 export async function renderVideoHookDemo({
   hookUrl,
   demoUrl,
   dimensions = "9:16",
   captionText = "",
-  captionStyle = "Classic",
+  captionStyle = "Outline",
+  /** How much of the trending clip to use, from its start. 0 or less keeps all of it. */
+  hookSeconds = 4,
+  /** "hook" (default) or "all". */
+  captionOver = "hook",
+  /** A background track under the whole video; null keeps the clips' own sound. */
+  audioUrl = null,
+  /** Mix the track under the clips' sound instead of replacing it -- for a hook that speaks. */
+  keepOriginal = false,
   fps = 30,
 }) {
   if (!hookUrl) throw new Error("a hook clip is required");
@@ -260,6 +274,9 @@ export async function renderVideoHookDemo({
     }
 
     const hookPath = await fetchTo(hookUrl, "hook.mp4");
+    const trim = Number(hookSeconds) > 0 ? Number(hookSeconds) : null;
+    // An input-level -t trims video and audio together, before decoding the rest.
+    if (trim) args.push("-t", String(trim));
     args.push("-i", hookPath);
     const hookIdx = nextInputIndex++;
 
@@ -267,37 +284,62 @@ export async function renderVideoHookDemo({
     args.push("-i", demoPath);
     const demoIdx = nextInputIndex++;
 
-    // The two segments, cover-fit to the same frame, each paired with its own
-    // (or a real silent) audio track -- concat with a=1 needs exactly one
-    // audio input per video input, same requirement as renderVideoAnimation.
-    async function buildSegment(inputIdx, sourcePath, label, withCaption) {
+    // Cover when the source's aspect is within 12% of the frame's, contain
+    // otherwise -- decided inside the filter from the decoded frame size, so
+    // a phone video carrying rotation metadata is judged the way it plays,
+    // not by its coded (sideways) width and height. `k` is 1 when the width
+    // is the limiting side. crop-then-pad makes the one chain serve both
+    // fits: crop only bites when the scaled frame overshoots (cover), pad
+    // only when it falls short (contain).
+    const r = (w / h).toFixed(6);
+    // The single quotes are what keep these commas from splitting the chain.
+    // XOR of two 0/1 tests, as abs(x-y): ffmpeg's expressions have no `ne`.
+    const k = `abs(lt(abs(a/${r}-1),0.12)-gt(a,${r}))`;
+    const demoFit =
+      `scale=w='if(${k},${w},-2)':h='if(${k},-2,${h})',` +
+      `crop='min(iw,${w})':'min(ih,${h})',` +
+      `pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2:color=black`;
+    const hookFit = `scale=${w}:${h}:force_original_aspect_ratio=increase,crop=${w}:${h}`;
+
+    let capIdx = null;
+    if (captionText.trim()) {
+      const capPng = await renderCaptionOverlay({
+        text: captionText,
+        style: captionStyle,
+        width: w,
+        height: h,
+        position: "center",
+        // The reference ads set the hook line larger than a caption.
+        scale: 1.35,
+      });
+      const capPath = join(dir, "cap.png");
+      await writeFile(capPath, capPng);
+      args.push("-loop", "1", "-i", capPath);
+      capIdx = nextInputIndex++;
+    }
+    const captionAll = capIdx !== null && captionOver === "all";
+    // One looped caption image can only feed one overlay.
+    if (capIdx !== null && !captionAll) filters.push(`[${capIdx}:v]null[caphook]`);
+
+    // Each segment paired with its own (or a real silent) audio track --
+    // concat with a=1 needs exactly one audio input per video input, same
+    // requirement as renderVideoAnimation.
+    async function buildSegment(inputIdx, sourcePath, label, fit, withCaption) {
       let vLabel = `v${label}`;
-      filters.push(
-        `[${inputIdx}:v]scale=${w}:${h}:force_original_aspect_ratio=increase,` +
-          `crop=${w}:${h},setsar=1,fps=${fps}[${vLabel}]`,
-      );
-      if (withCaption && captionText.trim()) {
-        const capPng = await renderCaptionOverlay({
-          text: captionText,
-          style: captionStyle,
-          width: w,
-          height: h,
-        });
-        const capPath = join(dir, `cap_${label}.png`);
-        await writeFile(capPath, capPng);
-        args.push("-loop", "1", "-i", capPath);
-        const capIdx = nextInputIndex++;
-        filters.push(`[${vLabel}][${capIdx}:v]overlay=0:0:shortest=1[vc${label}]`);
+      filters.push(`[${inputIdx}:v]${fit},setsar=1,fps=${fps}[${vLabel}]`);
+      if (withCaption) {
+        filters.push(`[${vLabel}][caphook]overlay=0:0:shortest=1[vc${label}]`);
         vLabel = `vc${label}`;
       }
 
-      const probed = await probe(sourcePath);
       const hasAudioStream = await hasAudio(sourcePath);
       const aLabel = `a${label}`;
       if (hasAudioStream) {
         filters.push(`[${inputIdx}:a]asetpts=PTS-STARTPTS[${aLabel}]`);
       } else {
-        const duration = Number(probed?.duration) || 5;
+        const probed = await probe(sourcePath);
+        const full = Number(probed?.duration) || 5;
+        const duration = label === "hook" && trim ? Math.min(trim, full) : full;
         args.push("-f", "lavfi", "-t", String(duration), "-i", "anullsrc=r=48000:cl=stereo");
         const aIdx = nextInputIndex++;
         filters.push(`[${aIdx}:a]asetpts=PTS-STARTPTS[${aLabel}]`);
@@ -305,12 +347,49 @@ export async function renderVideoHookDemo({
       return [`[${vLabel}]`, `[${aLabel}]`];
     }
 
-    const hookPair = await buildSegment(hookIdx, hookPath, "hook", true);
-    const demoPair = await buildSegment(demoIdx, demoPath, "demo", false);
+    const hookPair = await buildSegment(
+      hookIdx,
+      hookPath,
+      "hook",
+      hookFit,
+      capIdx !== null && !captionAll,
+    );
+    const demoPair = await buildSegment(demoIdx, demoPath, "demo", demoFit, false);
 
     filters.push(
-      `${hookPair[0]}${hookPair[1]}${demoPair[0]}${demoPair[1]}concat=n=2:v=1:a=1[outv][outa]`,
+      `${hookPair[0]}${hookPair[1]}${demoPair[0]}${demoPair[1]}concat=n=2:v=1:a=1[catv][cata]`,
     );
+    filters.push(
+      captionAll
+        ? `[catv][${capIdx}:v]overlay=0:0:shortest=1[outv]`
+        : `[catv]null[outv]`,
+    );
+
+    // A background track, cut and padded to exactly the video's length so a
+    // short one never shortens the video and a long one never lengthens it
+    // (same rule as Wall of Text). It replaces the clips' own sound, as there
+    // -- unless `keepOriginal`, for a hook someone speaks in, where it sits
+    // underneath instead of drowning the line out.
+    if (audioUrl) {
+      const hookDur = Number((await probe(hookPath))?.duration) || 5;
+      const total = (trim ? Math.min(trim, hookDur) : hookDur) + (Number((await probe(demoPath))?.duration) || 5);
+      const musicPath = await fetchTo(audioUrl, `music${audioExt(audioUrl)}`);
+      args.push("-i", musicPath);
+      const musicIdx = nextInputIndex++;
+      const fitted = `atrim=0:${total.toFixed(3)},asetpts=PTS-STARTPTS,apad=whole_dur=${total.toFixed(3)}`;
+      if (keepOriginal) {
+        filters.push(
+          `[${musicIdx}:a]${fitted},volume=0.25[mus]`,
+          `[cata][mus]amix=inputs=2:duration=first:normalize=0[outa]`,
+        );
+      } else {
+        // The clips' own sound still has to go somewhere: an unconnected
+        // filter output fails the whole graph.
+        filters.push(`[${musicIdx}:a]${fitted}[outa]`, `[cata]anullsink`);
+      }
+    } else {
+      filters.push(`[cata]anull[outa]`);
+    }
 
     const outPath = join(dir, "out.mp4");
     args.push(
@@ -461,6 +540,183 @@ export async function renderGreenScreenMeme({
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
+}
+
+/**
+ * Green Screen Meme, as its studio designs it: the client's background (a
+ * still or a video), a meme -- a GIF, a clip or a sticker -- moved, sized,
+ * mirrored and keyed where the editor put it, and the caption layer the
+ * format engine drew on top.
+ *
+ * The meme is composited here rather than drawn into the layer because it
+ * moves: the layer page is one screenshot, and a GIF in it would freeze on
+ * its first frame. Placement arrives as fractions of the 1080x1920 frame --
+ * the numbers the editor's preview is positioned from -- so what was
+ * dragged is what renders.
+ *
+ * Length: a background video sets it (up to `maxDurationSec`). Over a still,
+ * `seconds` does, or -- left to us -- the meme loops whole to about six
+ * seconds, so a two-second GIF isn't a two-second video.
+ *
+ * The meme's media is fetched from the URL given, as given, into a temp
+ * directory that is removed when the render ends -- nothing of it is kept.
+ */
+export async function renderMemeComposite({
+  backgroundUrl,
+  memeUrl,
+  layerPng,
+  meme = {},
+  sound = "meme",
+  seconds = null,
+  maxDurationSec = 60,
+  fps = 30,
+}) {
+  if (!backgroundUrl) throw new Error("a background is required");
+  if (!memeUrl) throw new Error("a meme is required");
+  const ffmpeg = resolveFfmpeg();
+  const [W, H] = dimensionsFor("9:16");
+  const dir = await mkdtemp(join(tmpdir(), "fe-meme-"));
+
+  try {
+    const bg = await fetchMedia(backgroundUrl, dir, "bg", "the background");
+    const mm = await fetchMedia(memeUrl, dir, "meme", "the meme");
+    const layerPath = join(dir, "layer.png");
+    await writeFile(layerPath, layerPng);
+
+    const memeLen = mm.kind === "still" ? 0 : Number((await probe(mm.path))?.duration) || 0;
+    let duration;
+    if (bg.kind === "video") {
+      duration = Math.min(Number((await probe(bg.path))?.duration) || maxDurationSec, maxDurationSec);
+    } else if (Number(seconds) > 0) {
+      duration = Math.min(Number(seconds), maxDurationSec);
+    } else if (memeLen > 0) {
+      // Whole loops, so the video ends where the meme does.
+      duration = Math.min(memeLen * Math.max(1, Math.ceil(6 / memeLen)), 20);
+    } else {
+      duration = 6;
+    }
+    const t = duration.toFixed(3);
+
+    const args = ["-y"];
+    if (bg.kind === "video") args.push("-i", bg.path);
+    else args.push("-loop", "1", "-framerate", String(fps), "-t", t, "-i", bg.path);
+    // Every meme input repeats for the whole video: a clip or GIF loops, a still holds.
+    if (mm.kind === "video") args.push("-stream_loop", "-1", "-t", t, "-i", mm.path);
+    else if (mm.kind === "gif") args.push("-ignore_loop", "0", "-t", t, "-i", mm.path);
+    else args.push("-loop", "1", "-framerate", String(fps), "-t", t, "-i", mm.path);
+    args.push("-i", layerPath);
+
+    const frac = (n, lo, hi, d) => Math.min(hi, Math.max(lo, Number.isFinite(Number(n)) ? Number(n) : d));
+    const cx = Math.round(W * frac(meme.x, 0, 1, 0.5));
+    const cy = Math.round(H * frac(meme.y, 0, 1, 0.58));
+    // Even, as yuv420p wants; the height follows the meme's own shape.
+    const mw = Math.max(2, Math.round((W * frac(meme.w, 0.1, 1.6, 0.86)) / 2) * 2);
+
+    const memeChain = [`fps=${fps}`];
+    if (meme.chroma) {
+      const key = await keyColour(mm.path);
+      memeChain.push(
+        "format=yuva444p",
+        key
+          ? `chromakey=0x${key}:0.16:0.08`
+          : // No green found in the corner: key studio green, a little looser.
+            "chromakey=0x00FF00:0.22:0.1",
+      );
+    }
+    if (meme.flip) memeChain.push("hflip");
+    memeChain.push(`scale=${mw}:-2`, "format=yuva420p");
+
+    const filters = [
+      `[0:v]scale=${W}:${H}:force_original_aspect_ratio=increase,crop=${W}:${H},setsar=1,fps=${fps}[bg]`,
+      `[1:v]${memeChain.join(",")}[m]`,
+      `[bg][m]overlay=x=${cx}-w/2:y=${cy}-h/2:eof_action=pass[c]`,
+      // A single still input holds its one frame for the whole video.
+      `[c][2:v]overlay=0:0[v]`,
+    ];
+
+    let audioMap = [];
+    if (sound === "meme" && (await hasAudio(mm.path))) audioMap = ["-map", "1:a"];
+    else if (sound === "background" && bg.kind === "video" && (await hasAudio(bg.path))) audioMap = ["-map", "0:a"];
+
+    const outPath = join(dir, "out.mp4");
+    args.push(
+      "-filter_complex",
+      filters.join(";"),
+      "-map",
+      "[v]",
+      ...audioMap,
+      "-t",
+      t,
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-profile:v",
+      "high",
+      "-preset",
+      "medium",
+      "-crf",
+      "20",
+      ...(audioMap.length ? ["-c:a", "aac", "-b:a", "160k"] : ["-an"]),
+      "-movflags",
+      "+faststart",
+      outPath,
+    );
+    await run(ffmpeg, args);
+
+    return { buffer: await readFile(outPath), width: W, height: H, durationSec: duration };
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * Downloads one input and says what it is -- a video, an animated GIF or a
+ * still -- from its Content-Type, then its URL, then its first bytes, since
+ * the demuxer options a GIF and a still need differ from a video's.
+ */
+async function fetchMedia(url, dir, name, what) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`failed to fetch ${what}: ${res.status}`);
+  const buf = Buffer.from(await res.arrayBuffer());
+  const type = String(res.headers.get("content-type") ?? "").split(";")[0].trim().toLowerCase();
+  const ext = /\.(gif|png|jpe?g|webp|mp4|webm|mov)(?:$|\?)/i.exec(url)?.[1]?.toLowerCase();
+  const magicGif = buf.subarray(0, 4).toString("latin1") === "GIF8";
+  const kind =
+    type === "image/gif" || ext === "gif" || magicGif
+      ? "gif"
+      : type.startsWith("video/") || ["mp4", "webm", "mov"].includes(ext)
+        ? "video"
+        : "still";
+  const path = join(dir, `${name}.${kind === "gif" ? "gif" : extFor(type, ext ?? (kind === "video" ? "mp4" : "png"))}`);
+  await writeFile(path, buf);
+  return { path, kind };
+}
+
+/**
+ * The green a meme was shot against, read from its first frame's top-left
+ * corner -- green screens are rarely studio #00FF00, and keying the color
+ * that's really there lets the similarity stay tight enough to spare the
+ * subject. Null when that corner isn't green.
+ */
+function keyColour(path) {
+  return new Promise((resolve) => {
+    const proc = spawn(
+      resolveFfmpeg(),
+      ["-v", "error", "-i", path, "-frames:v", "1", "-vf", "crop=8:8:2:2,scale=1:1:flags=area", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"],
+      { windowsHide: true },
+    );
+    const chunks = [];
+    proc.stdout.on("data", (d) => chunks.push(d));
+    proc.on("error", () => resolve(null));
+    proc.on("close", () => {
+      const px = Buffer.concat(chunks);
+      if (px.length < 3) return resolve(null);
+      const [r, g, b] = px;
+      const green = g > 80 && g > r * 1.35 && g > b * 1.35;
+      resolve(green ? [r, g, b].map((c) => c.toString(16).padStart(2, "0")).join("").toUpperCase() : null);
+    });
+  });
 }
 
 /**

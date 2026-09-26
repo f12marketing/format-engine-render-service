@@ -2,8 +2,8 @@
 
 The one thing Convex cannot do: run a real browser and `ffmpeg`.
 
-Twelve of the sixteen formats need video surgery — stitching, chroma key,
-picture-in-picture, burned-in captions — and a Convex action is neither a
+Most of the format engine's twenty-five formats need video surgery —
+stitching, chroma key, picture-in-picture, burned-in captions — and a Convex action is neither a
 browser nor an encoder. This is a separate deployable so it can scale with
 render minutes rather than with users.
 
@@ -33,8 +33,17 @@ npx convex env set RENDER_SERVICE_API_KEY <the same string>
   service reject everything but `/health`, on purpose: refusing is safer than
   serving unauthenticated.
 
-`GET /health` reports whether it found Chrome and ffmpeg, and needs no key —
-Railway's own healthcheck (`railway.json`) calls it with no headers.
+`GET /health` reports whether it found Chrome and ffmpeg, and whether a warm
+Chrome is running (`browserWarm`), and needs no key — Railway's own
+healthcheck (`railway.json`) calls it with no headers.
+
+**One warm Chrome.** Every renderer shares a single browser, started on the
+first render and given a fresh tab per render, instead of launching and
+closing its own each time. It closes after `BROWSER_IDLE_MS` with nothing
+open (default 5 minutes, so an idle service holds no Chrome), and is recycled
+every `BROWSER_RECYCLE_AFTER` tabs (default 300) so a slow leak in Chrome
+can't grow forever. A warm render of a two-slide carousel measured 0.41s
+against 1.02s cold.
 
 ## Endpoints
 
@@ -45,10 +54,11 @@ Railway's own healthcheck (`railway.json`) calls it with no headers.
 | `POST /render/slideshow` | N generated stills with Ken Burns zoom and a caption per slide, crossfaded, with optional music underneath — then optionally wrapped in uploaded bookend videos and branded title/end cards → an MP4. Voice is either one `voiceoverUrl` for the whole cut (every slide then holds exactly `secondsPerImage`, and the last is extended only if the voice outruns them) or an optional `narration` line per slide (a slide holds as long as its line takes) |
 | `POST /render/video-animation` | N clips, each with an optional caption and optional dialogue audio, stitched — optionally with one `voiceoverUrl` laid across the whole cut (each clip is then trimmed to exactly its `durationSec`, so the picture keeps the voice's clock) and a looped music bed under the voice, and wrapped in uploaded bookend videos and branded title/end cards → an MP4. Also the join for Kling's chained segments |
 | `POST /render/drama` | N filmed beats that keep their own lip-synced audio, with optional narration per beat, subtitles and a music bed → an MP4 |
-| `POST /render/video-hook-demo` | A trending clip then a demo video, caption on the hook → an MP4 |
-| `POST /render/green-screen-meme` | Chroma-keys a trending clip over the user's own background → an MP4 |
+| `POST /render/video-hook-demo` | A hook clip then a demo video (both hook + demo formats) → an MP4. When the job went through the studio, the format engine burns the caption onto the hook first through `/render/wall-of-text` and sends an empty `captionText` here. The route's own caption burn-in is only used by older jobs |
+| `POST /render/green-screen-meme` | A meme (GIF, clip, sticker or still from `memeUrl`) placed over the user's own photo or video (`backgroundUrl`) and captioned. The meme is placed at `meme` = `{x, y, w, flip, chroma}` (fractions of the 9:16 frame). With `chroma` on, its green is keyed out using a key color sampled from its corner. `sound` picks the audio: `meme`, `background` or `none`. `seconds` sets the length over a still. The text layer is `layerHtml`, screenshotted like Wall of Text's and laid over everything → an MP4. Without `layerHtml`, the older render: a trending clip keyed over a still with a fixed caption |
 | `POST /render/picture-in-picture` | An avatar keyed into a corner of a looping demo video → an MP4 |
 | `POST /render/custom` | An upload → an MP4 at a target ratio, with optional caption and overlay. Also the caption-burn step for every avatar format, which has no renderer of its own |
+| `POST /render/image-pages` | Image Slideshow's export: up to 20 full-frame HTML `pages` (built by the format engine from the same style module its editor previews with) → one JPEG (or PNG) each at `width`×`height`, uploaded to the matching entry of `uploadUrls` |
 | `POST /inspect/video` | A video URL → its duration and whether it has an audio track |
 | `POST /frame/first` | A video URL → its first frame, as a PNG |
 | `POST /extract/audio` | A video URL → just its audio track, as an MP3 |

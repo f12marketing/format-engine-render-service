@@ -29,6 +29,7 @@ import {
   renderDrama,
   renderVideoHookDemo,
   renderGreenScreenMeme,
+  renderMemeComposite,
   renderPictureInPicture,
   renderWallOfText,
   inspectVideo,
@@ -120,6 +121,98 @@ function resolveBrowser() {
   return found;
 }
 
+// ---- one warm Chrome -----------------------------------------------------------
+//
+// Starting Chrome costs a second or two of CPU and a few hundred MB of memory
+// spikes, and every render used to pay it -- a ten-slide export, a caption
+// layer and a brand card each launched and closed their own. Now one browser
+// is started on first use and shared: each render gets a fresh tab and closes
+// it. The browser is closed again after BROWSER_IDLE_MS with nothing open, so
+// an idle service holds no Chrome at all, and recycled every
+// BROWSER_RECYCLE_AFTER tabs so a slow leak in Chrome can't grow forever.
+
+const BROWSER_IDLE_MS = Number(process.env.BROWSER_IDLE_MS || 5 * 60_000);
+const BROWSER_RECYCLE_AFTER = Number(process.env.BROWSER_RECYCLE_AFTER || 300);
+
+let browserPromise = null;
+let openTabs = 0;
+let tabsServed = 0;
+let idleTimer = null;
+
+function launchBrowser() {
+  const launching = puppeteer.launch({
+    executablePath: resolveBrowser(),
+    headless: true,
+    args: ["--no-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"],
+  });
+  launching
+    .then((browser) =>
+      browser.on("disconnected", () => {
+        // A crash (or our own close) -- the next render starts a new one.
+        if (browserPromise === launching) browserPromise = null;
+      }),
+    )
+    .catch(() => {
+      if (browserPromise === launching) browserPromise = null;
+    });
+  return launching;
+}
+
+async function getBrowser() {
+  if (browserPromise) {
+    const browser = await browserPromise.catch(() => null);
+    if (browser?.connected) return browser;
+    browserPromise = null;
+  }
+  browserPromise = launchBrowser();
+  tabsServed = 0;
+  return browserPromise;
+}
+
+async function closeBrowser() {
+  const closing = browserPromise;
+  browserPromise = null;
+  tabsServed = 0;
+  const browser = await closing?.catch(() => null);
+  await browser?.close().catch(() => {});
+}
+
+function afterTab() {
+  if (openTabs > 0) return;
+  clearTimeout(idleTimer);
+  if (tabsServed >= BROWSER_RECYCLE_AFTER) {
+    void closeBrowser();
+    return;
+  }
+  idleTimer = setTimeout(() => void closeBrowser(), BROWSER_IDLE_MS);
+  idleTimer.unref?.();
+}
+
+/** Runs `fn` with a fresh tab in the shared browser, and always closes the tab. */
+async function withPage(fn) {
+  clearTimeout(idleTimer);
+  openTabs += 1;
+  try {
+    const browser = await getBrowser();
+    const page = await browser.newPage();
+    try {
+      return await fn(page);
+    } finally {
+      tabsServed += 1;
+      await page.close().catch(() => {});
+    }
+  } finally {
+    openTabs -= 1;
+    afterTab();
+  }
+}
+
+for (const signal of ["SIGINT", "SIGTERM"]) {
+  process.once(signal, () => {
+    void closeBrowser().finally(() => process.exit(0));
+  });
+}
+
 /**
  * CSS is INLINED rather than linked. The generated page then has no external
  * references at all, which sidesteps every origin quirk and leaves the HTML
@@ -180,15 +273,8 @@ async function renderCarousel(payload) {
   const css = await loadCss(template);
   const html = buildHtml({ slides, templateId: template, dims, branding, footerLeft, css });
 
-  const browser = await puppeteer.launch({
-    executablePath: resolveBrowser(),
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"],
-  });
-
   const files = [];
-  try {
-    const page = await browser.newPage();
+  await withPage(async (page) => {
     await page.setViewport({ width: dims[0], height: dims[1], deviceScaleFactor: 1 });
     await page.setContent(html, { waitUntil: "load" });
     await page.evaluateHandle("document.fonts.ready");
@@ -219,9 +305,7 @@ async function renderCarousel(payload) {
       contentType: "application/pdf",
       base64: Buffer.from(pdf).toString("base64"),
     });
-  } finally {
-    await browser.close();
-  }
+  });
 
   const captionText =
     `${[caption, "", hashtags.map((t) => `#${t}`).join(" ")].join("\n").trim()}\n`;
@@ -242,13 +326,7 @@ async function renderCarousel(payload) {
  * user input -- and it reuses the browser this service already launches.
  */
 async function renderCaptionLayer({ text, style, width, height, position, scale }) {
-  const browser = await puppeteer.launch({
-    executablePath: resolveBrowser(),
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"],
-  });
-  try {
-    const page = await browser.newPage();
+  return withPage(async (page) => {
     await page.setViewport({ width, height, deviceScaleFactor: 1 });
     await page.setContent(
       captionLayerHtml({ text, style, width, height, position, scale }),
@@ -257,9 +335,7 @@ async function renderCaptionLayer({ text, style, width, height, position, scale 
     await page.evaluateHandle("document.fonts.ready");
     // omitBackground is what makes this an overlay rather than a black card.
     return Buffer.from(await page.screenshot({ type: "png", omitBackground: true }));
-  } finally {
-    await browser.close();
-  }
+  });
 }
 
 /**
@@ -283,13 +359,7 @@ async function renderBrandCardImage({ kind, width, height, logoUrl, ...branding 
     logoDataUri = `data:${type};base64,${Buffer.from(await res.arrayBuffer()).toString("base64")}`;
   }
 
-  const browser = await puppeteer.launch({
-    executablePath: resolveBrowser(),
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"],
-  });
-  try {
-    const page = await browser.newPage();
+  return withPage(async (page) => {
     await page.setViewport({ width, height, deviceScaleFactor: 1 });
     await page.setContent(brandCardHtml({ ...branding, kind, width, height, logoDataUri }), {
       // The card pulls a Google Font over the network, so `load` alone can
@@ -298,9 +368,7 @@ async function renderBrandCardImage({ kind, width, height, logoUrl, ...branding 
     });
     await page.evaluateHandle("document.fonts.ready");
     return Buffer.from(await page.screenshot({ type: "png" }));
-  } finally {
-    await browser.close();
-  }
+  });
 }
 
 // video.mjs owns ffmpeg only; it cannot launch a browser itself, so the two
@@ -458,7 +526,11 @@ async function renderVideoHookDemoFormat(payload) {
     demoUrl,
     dimensions = "9:16",
     captionText = "",
-    captionStyle = "Classic",
+    captionStyle = "Outline",
+    hookSeconds = 4,
+    captionOver = "hook",
+    audioUrl = null,
+    keepOriginal = false,
     uploadUrl,
   } = payload;
   const { buffer, width, height } = await renderVideoHookDemo({
@@ -467,12 +539,27 @@ async function renderVideoHookDemoFormat(payload) {
     dimensions,
     captionText,
     captionStyle,
+    hookSeconds,
+    captionOver,
+    audioUrl,
+    keepOriginal: Boolean(keepOriginal),
   });
   return uploadResult(buffer, width, height, uploadUrl);
 }
 
 /** Green Screen Meme: chroma-key a trending clip over the user's background. */
 async function renderGreenScreenMemeFormat(payload) {
+  // The studio's format: a background, a placed meme, and a text layer drawn
+  // by the caller from the same style functions its editor previews with.
+  if (payload.layerHtml) {
+    const { layerHtml, backgroundUrl, memeUrl, meme, sound, seconds, uploadUrl } = payload;
+    if (typeof layerHtml !== "string") throw new Error("layerHtml must be a string");
+    const [w, h] = dimensionsFor("9:16");
+    const layerPng = await renderLayerHtml(layerHtml, w, h);
+    const out = await renderMemeComposite({ backgroundUrl, memeUrl, layerPng, meme, sound, seconds });
+    return { ...(await uploadResult(out.buffer, out.width, out.height, uploadUrl)), durationSec: out.durationSec };
+  }
+  // Jobs from before the studio: a trending green-screen clip keyed over a still.
   const {
     clipUrl,
     backgroundUrl,
@@ -601,13 +688,7 @@ async function renderCustomFormat(payload) {
  * a beat early ships in the fallback face, or without its overlay.
  */
 async function renderLayerHtml(html, width, height) {
-  const browser = await puppeteer.launch({
-    executablePath: resolveBrowser(),
-    headless: true,
-    args: ["--no-sandbox", "--disable-dev-shm-usage", "--font-render-hinting=none"],
-  });
-  try {
-    const page = await browser.newPage();
+  return withPage(async (page) => {
     await page.setViewport({ width, height, deviceScaleFactor: 1 });
     await page.setContent(html, { waitUntil: "networkidle0", timeout: 45_000 });
     await page.evaluate(async () => {
@@ -617,9 +698,7 @@ async function renderLayerHtml(html, width, height) {
       );
     });
     return Buffer.from(await page.screenshot({ type: "png", omitBackground: true }));
-  } finally {
-    await browser.close();
-  }
+  });
 }
 
 async function renderWallOfTextFormat(payload) {
@@ -634,6 +713,66 @@ async function renderWallOfTextFormat(payload) {
     maxDurationSec,
   });
   return { ...(await uploadResult(buffer, width, height, uploadUrl)), durationSec };
+}
+
+/**
+ * Image Slideshow's export: one full-frame page per slide, each screenshotted
+ * as an opaque image and uploaded straight to its own signed URL -- a deck of
+ * ten 1080x1920 JPEGs would clear Convex's argument ceiling as base64.
+ *
+ * Like Wall of Text's layer, every page is built by the format engine from
+ * the same style functions its editor previews with, and taken as given here.
+ * One browser serves the whole deck; each page waits for its web fonts and
+ * every image before it is shot, so nothing ships in a fallback face or
+ * without its photo.
+ */
+const MAX_PAGES = 20;
+
+async function renderImagePages(payload) {
+  const { pages, width, height, format = "jpeg", uploadUrls } = payload;
+  if (!Array.isArray(pages) || !pages.length) throw new Error("pages is required");
+  if (pages.length > MAX_PAGES) throw new Error(`at most ${MAX_PAGES} pages`);
+  if (!Array.isArray(uploadUrls) || uploadUrls.length !== pages.length) {
+    throw new Error("uploadUrls must have one URL per page");
+  }
+  const w = Math.round(Number(width));
+  const h = Math.round(Number(height));
+  if (!(w > 0 && w <= 2160 && h > 0 && h <= 3840)) throw new Error("bad width/height");
+  const type = format === "png" ? "png" : "jpeg";
+  const contentType = `image/${type}`;
+
+  const files = [];
+  for (let i = 0; i < pages.length; i++) {
+    if (typeof pages[i] !== "string" || !pages[i]) throw new Error(`page ${i + 1} is empty`);
+    // A fresh tab per slide: re-using one for a second setContent can wait
+    // on network idle forever once the first page's fonts are cached.
+    const buffer = await withPage(async (page) => {
+      await page.setViewport({ width: w, height: h, deviceScaleFactor: 1 });
+      await page.setContent(pages[i], { waitUntil: "load", timeout: 60_000 });
+      await page.evaluate(async () => {
+        await document.fonts.ready;
+        await Promise.all(
+          [...document.images].map((img) => (img.complete ? null : img.decode().catch(() => null))),
+        );
+      });
+      return Buffer.from(
+        await page.screenshot({
+          type,
+          ...(type === "jpeg" ? { quality: 92 } : {}),
+          clip: { x: 0, y: 0, width: w, height: h },
+        }),
+      );
+    });
+    const up = await fetch(uploadUrls[i], {
+      method: "POST",
+      headers: { "Content-Type": contentType },
+      body: buffer,
+    });
+    if (!up.ok) throw new Error(`upload of slide ${i + 1} failed: ${up.status} ${await up.text()}`);
+    const { storageId } = await up.json();
+    files.push({ storageId, bytes: buffer.length, contentType });
+  }
+  return { ok: true, width: w, height: h, files };
 }
 
 // ---- HTTP -------------------------------------------------------------------
@@ -672,6 +811,8 @@ const server = createServer(async (req, res) => {
       // A service without this field would ignore it and render the video
       // silently, so the format engine checks for it before it spends anything.
       voiceover: true,
+      // Whether a render right now would reuse the warm Chrome.
+      browserWarm: Boolean(browserPromise),
       // POST /label/ai exists: the format engine checks before scheduling a
       // post that asks for a burned-in AI label.
       aiLabel: true,
@@ -714,6 +855,16 @@ const server = createServer(async (req, res) => {
         textScale: p.textScale ?? 1.8,
       });
       return json(res, 200, out);
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  if (req.method === "POST" && req.url === "/render/image-pages") {
+    try {
+      const payload = await readBody(req);
+      return json(res, 200, await renderImagePages(payload));
     } catch (err) {
       console.error(String(err?.stack || err));
       return json(res, 500, { ok: false, error: String(err?.message || err) });
