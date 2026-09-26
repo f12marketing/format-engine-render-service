@@ -53,6 +53,7 @@ Railway's own healthcheck (`railway.json`) calls it with no headers.
 | `POST /frame/first` | A video URL → its first frame, as a PNG |
 | `POST /extract/audio` | A video URL → just its audio track, as an MP3 |
 | `POST /pack/images` | N image URLs → one zip archive, uploaded to the given URL |
+| `POST /label/ai` | A finished video or image (`mediaUrl`, `kind`) → the same with an "AI-generated" badge burned into the top-left corner (`burn`) and/or an AI tag in the MP4's metadata (`metadata`, videos only; metadata-only copies the streams without re-encoding), uploaded to `uploadUrl`. The format engine runs it when a post is scheduled with either switch on (`label.mjs`). `/health` reports `aiLabel: true` when this route exists |
 
 Two response shapes, not one. `/render/carousel` and the single-utility
 endpoints (`/inspect/video`, `/frame/first`, `/frame/last`, `/extract/audio`)

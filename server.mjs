@@ -40,6 +40,7 @@ import {
   setCardRenderer,
 } from "./video.mjs";
 import { packImages } from "./images.mjs";
+import { labelMedia } from "./label.mjs";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const TEMPLATES_DIR = join(ROOT, "carousel-templates");
@@ -671,6 +672,9 @@ const server = createServer(async (req, res) => {
       // A service without this field would ignore it and render the video
       // silently, so the format engine checks for it before it spends anything.
       voiceover: true,
+      // POST /label/ai exists: the format engine checks before scheduling a
+      // post that asks for a burned-in AI label.
+      aiLabel: true,
     });
   }
 
@@ -787,6 +791,42 @@ const server = createServer(async (req, res) => {
       const payload = await readBody(req);
       const out = await renderCustomFormat(payload);
       return json(res, 200, out);
+    } catch (err) {
+      console.error(String(err?.stack || err));
+      return json(res, 500, { ok: false, error: String(err?.message || err) });
+    }
+  }
+
+  // The AI-disclosure pass (label.mjs): a finished video or image with an
+  // "AI-generated" badge burned in and/or an AI tag in its metadata, uploaded
+  // straight to the caller's signed URL.
+  if (req.method === "POST" && req.url === "/label/ai") {
+    try {
+      const { mediaUrl, kind, burn, metadata, text, uploadUrl } = await readBody(req);
+      if (!uploadUrl) throw new Error("uploadUrl is required");
+      const out = await labelMedia({
+        mediaUrl,
+        kind,
+        burn: Boolean(burn),
+        metadata: Boolean(metadata),
+        text,
+        renderLayer: renderLayerHtml,
+      });
+      const up = await fetch(uploadUrl, {
+        method: "POST",
+        headers: { "Content-Type": out.contentType },
+        body: out.buffer,
+      });
+      if (!up.ok) throw new Error(`upload to storage failed: ${up.status} ${await up.text()}`);
+      const { storageId } = await up.json();
+      return json(res, 200, {
+        ok: true,
+        storageId,
+        width: out.width,
+        height: out.height,
+        bytes: out.buffer.length,
+        contentType: out.contentType,
+      });
     } catch (err) {
       console.error(String(err?.stack || err));
       return json(res, 500, { ok: false, error: String(err?.message || err) });
